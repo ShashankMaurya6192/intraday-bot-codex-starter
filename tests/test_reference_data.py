@@ -16,6 +16,10 @@ from trading_bot.broker import (
 from trading_bot.domain import IST, Exchange
 from trading_bot.reference_data import Nifty500Cache, Nifty500CacheError
 from trading_bot.reference_data.http import ReferenceDataDownloadError, download_https
+from trading_bot.reference_data.nifty500 import (
+    NIFTY500_CONSTITUENTS_URL,
+    NIFTY500_OFFICIAL_FALLBACK_URL,
+)
 from trading_bot.reference_data.universe import resolve_nse_equity_universe
 
 NOW = datetime(2026, 8, 10, 8, 30, tzinfo=IST)
@@ -254,3 +258,27 @@ def test_reference_downloader_has_bounded_retries(monkeypatch) -> None:
 
     assert attempts == 3
     assert delays == [1, 2]
+
+
+def test_nifty_refresh_uses_only_official_https_hosts_and_official_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    def fake_download(url: str, **_kwargs) -> bytes:
+        calls.append(url)
+        if url == NIFTY500_CONSTITUENTS_URL:
+            raise ReferenceDataDownloadError("primary unavailable")
+        return _nifty_csv("SBIN")
+
+    monkeypatch.setattr(
+        "trading_bot.reference_data.nifty500.download_https", fake_download
+    )
+    cache = Nifty500Cache(tmp_path / "nifty.json", max_age_seconds=3600)
+
+    assert cache.refresh(fetched_at=NOW) == 1
+    assert calls == [NIFTY500_CONSTITUENTS_URL, NIFTY500_OFFICIAL_FALLBACK_URL]
+    assert cache.metadata.source_url == NIFTY500_OFFICIAL_FALLBACK_URL
+
+    with pytest.raises(Nifty500CacheError, match="official NSE host"):
+        cache.refresh(source="https://unofficial.example/nifty500.csv", fetched_at=NOW)

@@ -71,6 +71,26 @@ def session_vwap(
     return IndicatorResult.ready_value(weighted / Decimal(total_volume))
 
 
+def session_twap(
+    candles: list[Candle] | tuple[Candle, ...],
+) -> IndicatorResult[Decimal]:
+    """Non-volume session anchor for indices.
+
+    The value is the arithmetic mean of each completed, trusted candle's typical
+    price. Index volume is deliberately ignored because it is not traded volume.
+    """
+    usable = _usable(candles)
+    if not usable:
+        return IndicatorResult.not_ready("no_completed_trusted_candles")
+    typical_prices = [
+        (candle.high_price + candle.low_price + candle.close_price) / Decimal(3)
+        for candle in usable
+    ]
+    return IndicatorResult.ready_value(
+        sum(typical_prices, Decimal(0)) / Decimal(len(typical_prices))
+    )
+
+
 def ema(
     values: list[Decimal] | tuple[Decimal, ...], period: int
 ) -> IndicatorResult[Decimal]:

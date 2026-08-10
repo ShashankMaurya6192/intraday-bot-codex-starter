@@ -7,6 +7,8 @@ def test_phase2_cli_exposes_only_data_and_analysis_commands() -> None:
         "refresh-instruments",
         "refresh-intraday-universe",
         "refresh-nifty500",
+        "record-scanner-market",
+        "bootstrap-history",
         "data-status",
         "replay",
         "scan",

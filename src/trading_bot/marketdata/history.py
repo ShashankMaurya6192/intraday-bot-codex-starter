@@ -1,0 +1,436 @@
+"""Explicit, restartable SmartAPI historical-candle bootstrap."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from typing import Protocol
+
+from trading_bot.broker import BrokerInstrument
+from trading_bot.domain import IST, Exchange
+
+from .candles import NSE_SESSION_CLOSE, NSE_SESSION_OPEN
+from .models import Candle, CandleInterval
+
+
+class HistoricalBootstrapError(RuntimeError):
+    """A historical response cannot safely update the local dataset."""
+
+
+class HistoricalDataBroker(Protocol):
+    def fetch_historical_candles(
+        self, parameters: Mapping[str, object]
+    ) -> Mapping[str, object]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalBootstrapStatus:
+    exchange: Exchange
+    symbol_token: str
+    trading_symbol: str
+    from_date: date
+    through_date: date
+    fetched_at: datetime
+    sessions_found: int
+    one_minute_candles: int
+    five_minute_candles: int
+    source_sha256: str
+
+    @property
+    def cache_age_seconds(self) -> float:
+        return max(0.0, (datetime.now(IST) - self.fetched_at).total_seconds())
+
+
+class HistoricalBootstrapStore(Protocol):
+    def load_historical_bootstrap_status(
+        self, *, exchange: Exchange, symbol_token: str
+    ) -> HistoricalBootstrapStatus | None: ...
+
+    def replace_historical_dataset(
+        self,
+        *,
+        instrument: BrokerInstrument,
+        one_minute_candles: Sequence[Candle],
+        five_minute_candles: Sequence[Candle],
+        complete_session_dates: Sequence[date],
+        from_date: date,
+        through_date: date,
+        fetched_at: datetime,
+        source_sha256: str,
+        build_rvol_baselines: bool,
+    ) -> HistoricalBootstrapStatus: ...
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalSymbolResult:
+    symbol: str
+    status: str
+    sessions_found: int
+    cache_age_seconds: float | None
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "symbol": self.symbol,
+            "status": self.status,
+            "sessions_found": self.sessions_found,
+            "cache_age_seconds": self.cache_age_seconds,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalBootstrapResult:
+    requested_symbols: int
+    completed_symbols: int
+    failed_symbols: int
+    sessions_found: int
+    cache_age_seconds: float | None
+    symbols: tuple[HistoricalSymbolResult, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "requested_symbols": self.requested_symbols,
+            "completed_symbols": self.completed_symbols,
+            "failed_symbols": self.failed_symbols,
+            "sessions_found": self.sessions_found,
+            "cache_age_seconds": self.cache_age_seconds,
+            "symbols": [item.to_dict() for item in self.symbols],
+            "order_placement_available": False,
+        }
+
+
+class HistoricalBootstrapService:
+    """Fetch complete prior sessions without running on record/scan hot paths."""
+
+    def __init__(
+        self,
+        broker: HistoricalDataBroker,
+        store: HistoricalBootstrapStore,
+        *,
+        lookback_days: int = 30,
+        minimum_sessions: int = 15,
+        request_delay_seconds: float = 0.5,
+        max_attempts: int = 3,
+        retry_initial_delay_seconds: float = 1.0,
+        retry_max_delay_seconds: float = 8.0,
+        sleeper=time.sleep,
+    ) -> None:
+        if not 22 <= lookback_days <= 30:
+            raise ValueError("historical lookback must be between 22 and 30 days")
+        if minimum_sessions < 1:
+            raise ValueError("historical minimum sessions must be positive")
+        if request_delay_seconds < 0:
+            raise ValueError("historical request delay must be non-negative")
+        if max_attempts < 1:
+            raise ValueError("historical max attempts must be positive")
+        if retry_initial_delay_seconds > retry_max_delay_seconds:
+            raise ValueError("historical retry delay bounds are invalid")
+        self._broker = broker
+        self._store = store
+        self._lookback_days = lookback_days
+        self._minimum_sessions = minimum_sessions
+        self._request_delay = request_delay_seconds
+        self._max_attempts = max_attempts
+        self._retry_initial = retry_initial_delay_seconds
+        self._retry_max = retry_max_delay_seconds
+        self._sleeper = sleeper
+
+    def bootstrap(
+        self,
+        instruments: Sequence[BrokerInstrument],
+        *,
+        benchmark: BrokerInstrument,
+        now: datetime,
+        force: bool = False,
+    ) -> HistoricalBootstrapResult:
+        now_ist = _aware(now)
+        if benchmark.instrument_type != "AMXIDX":
+            raise HistoricalBootstrapError("benchmark must be an AMXIDX instrument")
+        all_instruments = tuple(
+            sorted(
+                {
+                    (item.exchange, item.symbol_token): item
+                    for item in (*instruments, benchmark)
+                }.values(),
+                key=lambda item: item.trading_symbol,
+            )
+        )
+        through_date = now_ist.date() - timedelta(days=1)
+        from_date = through_date - timedelta(days=self._lookback_days - 1)
+        results: list[HistoricalSymbolResult] = []
+        request_number = 0
+        for instrument in all_instruments:
+            previous = self._store.load_historical_bootstrap_status(
+                exchange=instrument.exchange,
+                symbol_token=instrument.symbol_token,
+            )
+            if (
+                not force
+                and previous is not None
+                and previous.from_date <= from_date
+                and previous.through_date >= through_date
+                and previous.sessions_found >= self._minimum_sessions
+            ):
+                results.append(
+                    HistoricalSymbolResult(
+                        symbol=instrument.trading_symbol,
+                        status="SKIPPED_CURRENT",
+                        sessions_found=previous.sessions_found,
+                        cache_age_seconds=max(
+                            0.0, (now_ist - previous.fetched_at).total_seconds()
+                        ),
+                    )
+                )
+                continue
+            if request_number:
+                self._sleeper(self._request_delay)
+            request_number += 1
+            parameters = {
+                "exchange": _historical_exchange(instrument.exchange),
+                "symboltoken": instrument.symbol_token,
+                "interval": "ONE_MINUTE",
+                "fromdate": f"{from_date.isoformat()} 09:15",
+                "todate": f"{through_date.isoformat()} 15:30",
+            }
+            try:
+                response = self._fetch_with_retries(parameters)
+                one_minute, session_dates = normalize_historical_response(
+                    response,
+                    instrument=instrument,
+                    minimum_sessions=self._minimum_sessions,
+                )
+                five_minute = aggregate_historical_five_minute(one_minute)
+                source_sha256 = hashlib.sha256(
+                    json.dumps(
+                        response,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                status = self._store.replace_historical_dataset(
+                    instrument=instrument,
+                    one_minute_candles=one_minute,
+                    five_minute_candles=five_minute,
+                    complete_session_dates=session_dates,
+                    from_date=from_date,
+                    through_date=through_date,
+                    fetched_at=now_ist,
+                    source_sha256=source_sha256,
+                    build_rvol_baselines=instrument.instrument_type != "AMXIDX",
+                )
+                results.append(
+                    HistoricalSymbolResult(
+                        symbol=instrument.trading_symbol,
+                        status="COMPLETED",
+                        sessions_found=status.sessions_found,
+                        cache_age_seconds=0.0,
+                    )
+                )
+            except Exception as exc:
+                results.append(
+                    HistoricalSymbolResult(
+                        symbol=instrument.trading_symbol,
+                        status="FAILED",
+                        sessions_found=previous.sessions_found if previous else 0,
+                        cache_age_seconds=(
+                            max(0.0, (now_ist - previous.fetched_at).total_seconds())
+                            if previous
+                            else None
+                        ),
+                        reason=type(exc).__name__,
+                    )
+                )
+
+        completed = tuple(item for item in results if item.status != "FAILED")
+        ages = [
+            item.cache_age_seconds
+            for item in completed
+            if item.cache_age_seconds is not None
+        ]
+        return HistoricalBootstrapResult(
+            requested_symbols=len(all_instruments),
+            completed_symbols=len(completed),
+            failed_symbols=len(results) - len(completed),
+            sessions_found=sum(item.sessions_found for item in completed),
+            cache_age_seconds=max(ages) if ages else None,
+            symbols=tuple(sorted(results, key=lambda item: item.symbol)),
+        )
+
+    def _fetch_with_retries(
+        self, parameters: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        last_error: Exception | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                response = self._broker.fetch_historical_candles(parameters)
+                if response.get("status") is not True:
+                    raise HistoricalBootstrapError(
+                        "Angel rejected the historical-candle request"
+                    )
+                return response
+            except Exception as exc:
+                last_error = exc
+                if attempt < self._max_attempts:
+                    delay = min(
+                        self._retry_initial * (2 ** (attempt - 1)), self._retry_max
+                    )
+                    self._sleeper(delay)
+        raise HistoricalBootstrapError(
+            f"historical request failed after {self._max_attempts} attempts"
+        ) from last_error
+
+
+def normalize_historical_response(
+    response: Mapping[str, object],
+    *,
+    instrument: BrokerInstrument,
+    minimum_sessions: int,
+) -> tuple[tuple[Candle, ...], tuple[date, ...]]:
+    """Validate every row and retain only fully contiguous NSE cash sessions."""
+    if response.get("status") is not True:
+        raise HistoricalBootstrapError("historical response status is not successful")
+    rows = response.get("data")
+    if not isinstance(rows, list) or not rows:
+        raise HistoricalBootstrapError("historical response has no candle data")
+    candles: list[Candle] = []
+    seen: set[datetime] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) != 6:
+            raise HistoricalBootstrapError(
+                f"historical candle row {index} has an unexpected schema"
+            )
+        try:
+            raw_start = datetime.fromisoformat(str(row[0]))
+            if raw_start.tzinfo is None or raw_start.utcoffset() is None:
+                raise ValueError("historical timestamp must be timezone-aware")
+            start_at = raw_start.astimezone(IST)
+            volume = _strict_nonnegative_int(row[5])
+            candle = Candle(
+                exchange=instrument.exchange,
+                symbol_token=instrument.symbol_token,
+                trading_symbol=instrument.trading_symbol,
+                interval=CandleInterval.ONE_MINUTE,
+                start_at=start_at,
+                end_at=start_at + timedelta(minutes=1),
+                open_price=Decimal(str(row[1])),
+                high_price=Decimal(str(row[2])),
+                low_price=Decimal(str(row[3])),
+                close_price=Decimal(str(row[4])),
+                volume=volume,
+                tick_count=1,
+                completed=True,
+                trusted=True,
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise HistoricalBootstrapError(
+                f"historical candle row {index} is malformed"
+            ) from exc
+        if start_at.second or start_at.microsecond:
+            raise HistoricalBootstrapError("historical candle is not minute-aligned")
+        local_time = start_at.timetz().replace(tzinfo=None)
+        if not NSE_SESSION_OPEN <= local_time < NSE_SESSION_CLOSE:
+            raise HistoricalBootstrapError("historical candle is outside NSE hours")
+        if start_at in seen:
+            raise HistoricalBootstrapError("historical response has duplicate candles")
+        seen.add(start_at)
+        candles.append(candle)
+
+    by_date: dict[date, list[Candle]] = {}
+    for candle in sorted(candles, key=lambda item: item.start_at):
+        by_date.setdefault(candle.start_at.date(), []).append(candle)
+    expected_offsets = set(range(375))
+    complete: list[Candle] = []
+    session_dates: list[date] = []
+    for session_date, session_candles in sorted(by_date.items()):
+        session_open = datetime.combine(session_date, NSE_SESSION_OPEN, tzinfo=IST)
+        offsets = {
+            int((candle.start_at - session_open).total_seconds() // 60)
+            for candle in session_candles
+        }
+        if offsets != expected_offsets or len(session_candles) != 375:
+            raise HistoricalBootstrapError(
+                f"historical response contains a partial session: {session_date}"
+            )
+        complete.extend(session_candles)
+        session_dates.append(session_date)
+    if len(session_dates) < minimum_sessions:
+        raise HistoricalBootstrapError(
+            "historical response has insufficient complete prior sessions"
+        )
+    return tuple(complete), tuple(session_dates)
+
+
+def aggregate_historical_five_minute(
+    one_minute_candles: Sequence[Candle],
+) -> tuple[Candle, ...]:
+    """Derive trusted five-minute candles from contiguous canonical one-minute data."""
+    grouped: dict[tuple[Exchange, str, datetime], list[Candle]] = {}
+    for candle in one_minute_candles:
+        session_open = datetime.combine(
+            candle.start_at.date(), NSE_SESSION_OPEN, tzinfo=IST
+        )
+        offset = int((candle.start_at - session_open).total_seconds() // 60)
+        bucket = session_open + timedelta(minutes=(offset // 5) * 5)
+        grouped.setdefault((candle.exchange, candle.symbol_token, bucket), []).append(
+            candle
+        )
+    result: list[Candle] = []
+    for (_, _, start_at), items in sorted(
+        grouped.items(), key=lambda item: item[0][2]
+    ):
+        items.sort(key=lambda item: item.start_at)
+        if len(items) != 5 or any(
+            current.end_at != following.start_at
+            for current, following in zip(items[:-1], items[1:], strict=True)
+        ):
+            raise HistoricalBootstrapError(
+                "canonical one-minute history cannot form a complete five-minute candle"
+            )
+        result.append(
+            Candle(
+                exchange=items[0].exchange,
+                symbol_token=items[0].symbol_token,
+                trading_symbol=items[0].trading_symbol,
+                interval=CandleInterval.FIVE_MINUTES,
+                start_at=start_at,
+                end_at=start_at + timedelta(minutes=5),
+                open_price=items[0].open_price,
+                high_price=max(item.high_price for item in items),
+                low_price=min(item.low_price for item in items),
+                close_price=items[-1].close_price,
+                volume=sum(item.volume for item in items),
+                tick_count=sum(item.tick_count for item in items),
+                completed=True,
+                trusted=True,
+            )
+        )
+    return tuple(result)
+
+
+def _strict_nonnegative_int(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("volume must be an integer")
+    decimal_value = Decimal(str(value))
+    integer = int(decimal_value)
+    if decimal_value != Decimal(integer) or integer < 0:
+        raise ValueError("volume must be a non-negative integer")
+    return integer
+
+
+def _historical_exchange(exchange: Exchange) -> str:
+    if exchange is not Exchange.NSE_CM:
+        raise HistoricalBootstrapError("Phase 2.1 history supports NSE cash only")
+    return "NSE"
+
+
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("historical bootstrap time must be timezone-aware")
+    return value.astimezone(IST)

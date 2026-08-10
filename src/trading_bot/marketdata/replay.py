@@ -20,8 +20,17 @@ class ReplayStore(Protocol):
         *,
         start_at: datetime | None = None,
         end_at: datetime | None = None,
+        received_at_or_before: datetime | None = None,
         received_order: bool = False,
     ) -> list[MarketTick]: ...
+
+    def count_ticks(
+        self,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        received_at_or_before: datetime | None = None,
+    ) -> int: ...
 
     def record_candles(self, candles: Sequence[Candle]) -> int: ...
 
@@ -45,6 +54,19 @@ class ReplayResult:
     health: tuple[InstrumentHealth, ...]
     accepted_ticks: int
     rejected_ticks: int
+    raw_ticks_replayed: int
+    ignored_future_ticks: int
+
+
+class ReplaySafetyLimitExceeded(RuntimeError):
+    """A replay was rejected before loading an unsafe number of raw ticks."""
+
+    def __init__(self, *, tick_count: int, hard_limit: int) -> None:
+        self.tick_count = tick_count
+        self.hard_limit = hard_limit
+        super().__init__(
+            f"replay tick count {tick_count} exceeds configured hard limit {hard_limit}"
+        )
 
 
 class MarketReplayEngine:
@@ -66,6 +88,7 @@ class MarketReplayEngine:
         evaluation_at: datetime | None = None,
         feed_epoch_starts: Sequence[datetime] = (),
     ) -> ReplayResult:
+        cutoff = _aware(evaluation_at) if evaluation_at is not None else None
         monitor = MarketDataHealthMonitor(
             stale_after_seconds=self._stale_after_seconds,
             recovery_consecutive_ticks=self._recovery_ticks,
@@ -75,8 +98,17 @@ class MarketReplayEngine:
         candles: list[Candle] = []
         accepted = 0
         rejected = 0
+        visible_ticks = [
+            tick
+            for tick in ticks
+            if cutoff is None
+            or (
+                tick.received_at <= cutoff
+                and tick.exchange_timestamp <= cutoff
+            )
+        ]
         ordered_ticks = sorted(
-            ticks,
+            visible_ticks,
             key=lambda tick: (
                 tick.received_at,
                 tick.exchange.value,
@@ -84,7 +116,11 @@ class MarketReplayEngine:
                 tick.sequence_number,
             ),
         )
-        epoch_starts = sorted(_aware(value) for value in feed_epoch_starts)
+        epoch_starts = sorted(
+            timestamp
+            for timestamp in (_aware(value) for value in feed_epoch_starts)
+            if cutoff is None or timestamp <= cutoff
+        )
         epoch_index = 0
         for tick in ordered_ticks:
             while (
@@ -100,11 +136,16 @@ class MarketReplayEngine:
             accepted += 1
             candles.extend(aggregator.process(tick, trusted=assessment.trusted))
 
+        while epoch_index < len(epoch_starts):
+            monitor.begin_feed_epoch(at=epoch_starts[epoch_index])
+            epoch_index += 1
+
         if ordered_ticks:
             last_date = max(tick.exchange_timestamp.date() for tick in ordered_ticks)
-            flush_at = datetime.combine(last_date, time(15, 30), tzinfo=IST)
+            session_close = datetime.combine(last_date, time(15, 30), tzinfo=IST)
+            flush_at = session_close if cutoff is None else min(cutoff, session_close)
             candles.extend(aggregator.flush(until=flush_at))
-            health_at = evaluation_at or max(tick.received_at for tick in ordered_ticks)
+            health_at = cutoff or max(tick.received_at for tick in ordered_ticks)
             health = monitor.all_health(now=health_at)
         else:
             health = ()
@@ -123,6 +164,8 @@ class MarketReplayEngine:
             health=health,
             accepted_ticks=accepted,
             rejected_ticks=rejected,
+            raw_ticks_replayed=len(ordered_ticks),
+            ignored_future_ticks=len(ticks) - len(visible_ticks),
         )
 
     def replay_date(
@@ -132,12 +175,28 @@ class MarketReplayEngine:
         *,
         evaluation_at: datetime | None = None,
         persist: bool = True,
+        hard_tick_limit: int | None = None,
     ) -> ReplayResult:
         start_at = datetime.combine(session_date, time.min, tzinfo=IST)
         end_at = start_at + timedelta(days=1)
+        cutoff = _aware(evaluation_at) if evaluation_at is not None else None
+        if hard_tick_limit is not None:
+            if hard_tick_limit < 1:
+                raise ValueError("hard_tick_limit must be positive")
+            tick_count = store.count_ticks(
+                start_at=start_at,
+                end_at=end_at,
+                received_at_or_before=cutoff,
+            )
+            if tick_count > hard_tick_limit:
+                raise ReplaySafetyLimitExceeded(
+                    tick_count=tick_count,
+                    hard_limit=hard_tick_limit,
+                )
         ticks = store.load_ticks(
             start_at=start_at,
             end_at=end_at,
+            received_at_or_before=cutoff,
             received_order=True,
         )
         connected_events = tuple(
@@ -154,7 +213,10 @@ class MarketReplayEngine:
             evaluation_at=evaluation_at,
             feed_epoch_starts=epoch_starts,
         )
-        if persist:
+        # As-of views are intentionally ephemeral: a late-arriving tick can still
+        # alter an earlier bucket, so persisting an as-of candle would poison the
+        # idempotency key for a later complete historical replay.
+        if persist and cutoff is None:
             store.record_candles(result.candles)
             _persist_complete_baselines(store, result.candles, session_date)
         return result

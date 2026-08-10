@@ -20,6 +20,9 @@ def test_default_is_paper() -> None:
     assert settings.intraday_universe_max_age_seconds == 28_800
     assert settings.relative_volume_lookback_sessions == 15
     assert settings.relative_volume_minimum_sessions == 10
+    assert settings.historical_bootstrap_lookback_days == 30
+    assert settings.historical_bootstrap_minimum_sessions == 15
+    assert settings.scan_replay_hard_tick_limit == 2_000_000
     assert settings.configured_scanner_symbols() == ()
 
 

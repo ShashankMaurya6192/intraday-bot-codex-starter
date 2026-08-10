@@ -7,6 +7,7 @@ import io
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from trading_bot.domain import IST
 
@@ -18,14 +19,22 @@ from .cache import (
     require_fresh,
     write_atomic_cache,
 )
-from .http import download_https
+from .http import ReferenceDataDownloadError, download_https
 
 NIFTY500_CONSTITUENTS_URL = (
-    "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+    "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+)
+NIFTY500_OFFICIAL_FALLBACK_URL = (
+    "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
 )
 _SCHEMA_VERSION = 1
 _MAX_DOWNLOAD_BYTES = 5_000_000
 _REQUIRED_COLUMNS = {"Company Name", "Industry", "Symbol", "Series", "ISIN Code"}
+_OFFICIAL_HTTPS_HOSTS = {
+    "nsearchives.nseindia.com",
+    "archives.nseindia.com",
+    "www.niftyindices.com",
+}
 
 
 class Nifty500CacheError(ReferenceDataError):
@@ -103,15 +112,36 @@ class Nifty500Cache:
         fetched_at: datetime | None = None,
     ) -> int:
         payload = source_bytes
+        actual_source = source
         if payload is None:
             if source.lower().startswith("https://"):
-                payload = download_https(
-                    source,
-                    connect_timeout_seconds=self._connect_timeout_seconds,
-                    read_timeout_seconds=self._read_timeout_seconds,
-                    max_attempts=self._refresh_attempts,
-                    max_bytes=_MAX_DOWNLOAD_BYTES,
+                if urlsplit(source).hostname not in _OFFICIAL_HTTPS_HOSTS:
+                    raise Nifty500CacheError(
+                        "NIFTY 500 HTTPS source must be an official NSE host"
+                    )
+                sources = (
+                    (NIFTY500_CONSTITUENTS_URL, NIFTY500_OFFICIAL_FALLBACK_URL)
+                    if source == NIFTY500_CONSTITUENTS_URL
+                    else (source,)
                 )
+                last_error: ReferenceDataDownloadError | None = None
+                for candidate in sources:
+                    try:
+                        payload = download_https(
+                            candidate,
+                            connect_timeout_seconds=self._connect_timeout_seconds,
+                            read_timeout_seconds=self._read_timeout_seconds,
+                            max_attempts=self._refresh_attempts,
+                            max_bytes=_MAX_DOWNLOAD_BYTES,
+                        )
+                        actual_source = candidate
+                        break
+                    except ReferenceDataDownloadError as exc:
+                        last_error = exc
+                if payload is None:
+                    raise Nifty500CacheError(
+                        "all official NIFTY 500 sources failed"
+                    ) from last_error
             else:
                 try:
                     payload = Path(source).expanduser().resolve().read_bytes()
@@ -125,7 +155,7 @@ class Nifty500Cache:
         metadata = make_metadata(
             fetched_at=timestamp,
             source_bytes=payload,
-            source_url=source,
+            source_url=actual_source,
             schema_version=_SCHEMA_VERSION,
             records=records,
         )

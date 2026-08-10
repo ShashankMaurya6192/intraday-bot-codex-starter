@@ -38,9 +38,10 @@ def _candle(
     symbol: str = "ABC-EQ",
     volume: int = 10,
     trusted: bool = True,
+    base: datetime = BASE,
 ) -> Candle:
     close = start_price + step * index
-    start = BASE + timedelta(minutes=int(interval) * index)
+    start = base + timedelta(minutes=int(interval) * index)
     return Candle(
         exchange=Exchange.NSE_CM,
         symbol_token=token,
@@ -154,6 +155,29 @@ def test_rvol_relative_strength_and_opening_range_are_like_for_like() -> None:
     assert opening_range(candles[:14], minutes=15).status is IndicatorStatus.NOT_READY
 
 
+def test_rolling_atr_preserves_the_overnight_gap() -> None:
+    previous_session = [
+        _candle(
+            index,
+            interval=CandleInterval.FIVE_MINUTES,
+            start_price=Decimal("100"),
+            step=Decimal("0"),
+            base=BASE - timedelta(days=3),
+        )
+        for index in range(14)
+    ]
+    gap_open = _candle(
+        0,
+        interval=CandleInterval.FIVE_MINUTES,
+        start_price=Decimal("110"),
+        step=Decimal("0"),
+    )
+
+    result = atr([*previous_session, gap_open], 14)
+
+    assert result.value == (Decimal("0.10") * 13 + Decimal("10.05")) / 14
+
+
 def test_market_regime_fails_closed_and_classifies_trend() -> None:
     benchmark = [
         _candle(
@@ -228,14 +252,24 @@ def _scanner_fixture():
         )
         for index in range(20)
     ]
+    prior_base = BASE - timedelta(days=3)
     stock_five = [
         _candle(
             index,
             interval=CandleInterval.FIVE_MINUTES,
             start_price=Decimal("99.5"),
             step=Decimal("0.03"),
+            base=prior_base,
         )
         for index in range(20)
+    ] + [
+        _candle(
+            index,
+            interval=CandleInterval.FIVE_MINUTES,
+            start_price=Decimal("100.1"),
+            step=Decimal("0.03"),
+        )
+        for index in range(4)
     ]
     second_candles = [
         Candle(
@@ -273,8 +307,19 @@ def _scanner_fixture():
             step=Decimal("0.1"),
             token="999",
             symbol="NIFTY",
+            base=prior_base,
         )
         for index in range(20)
+    ] + [
+        _candle(
+            index,
+            interval=CandleInterval.FIVE_MINUTES,
+            start_price=Decimal("102"),
+            step=Decimal("0.1"),
+            token="999",
+            symbol="NIFTY",
+        )
+        for index in range(4)
     ]
     candles = {
         (Exchange.NSE_CM, "1"): stock_one + stock_five,
@@ -361,3 +406,88 @@ def test_scanner_suppresses_stale_data_and_unknown_regime() -> None:
     assert unknown.readiness is ScannerReadiness.NOT_READY
     assert unknown.market_regime is MarketRegime.UNKNOWN
     assert not unknown.long_candidates
+
+
+def test_prior_sessions_warm_rolling_indicators_and_session_open_is_required() -> None:
+    first, _, benchmark, candles, health = _scanner_fixture()
+    scanner = MarketScanner()
+    ready = scanner.scan(
+        instruments=(first,),
+        candles_by_instrument=candles,
+        health_by_instrument=health,
+        benchmark=benchmark,
+        baseline_store=FixedBaseline(),
+        now=BASE + timedelta(minutes=20),
+        expected_eligibility_diagnostics=(
+            "EXPECTED:not_currently_intraday_allowed",
+        ),
+        requested_count=2,
+    )
+
+    assert ready.readiness is ScannerReadiness.READY
+    assert ready.expected_ineligible_count == 1
+    assert ready.eligible_count == 1
+    assert ready.long_candidates[0].ema20 > 0
+    assert ready.long_candidates[0].atr14 > 0
+
+    with_prior_session_one_minute = dict(candles)
+    with_prior_session_one_minute[(Exchange.NSE_CM, "1")] = [
+        *candles[(Exchange.NSE_CM, "1")],
+        _candle(
+            0,
+            start_price=Decimal("1000"),
+            step=Decimal("0"),
+            base=BASE - timedelta(days=3),
+        ),
+    ]
+    session_isolated = scanner.scan(
+        instruments=(first,),
+        candles_by_instrument=with_prior_session_one_minute,
+        health_by_instrument=health,
+        benchmark=benchmark,
+        baseline_store=FixedBaseline(),
+        now=BASE + timedelta(minutes=20),
+    )
+    assert session_isolated.long_candidates[0].vwap == ready.long_candidates[0].vwap
+
+    stock_key = (Exchange.NSE_CM, "1")
+    missing_open = dict(candles)
+    missing_open[stock_key] = [
+        candle
+        for candle in candles[stock_key]
+        if not (
+            candle.interval is CandleInterval.ONE_MINUTE
+            and candle.start_at == BASE
+        )
+    ]
+    not_ready = scanner.scan(
+        instruments=(first,),
+        candles_by_instrument=missing_open,
+        health_by_instrument=health,
+        benchmark=benchmark,
+        baseline_store=FixedBaseline(),
+        now=BASE + timedelta(minutes=20),
+    )
+
+    assert not_ready.readiness is ScannerReadiness.DEGRADED
+    assert any(
+        reason.endswith(":session_open_not_ready")
+        for reason in not_ready.diagnostics.indicator_not_ready
+    )
+
+
+def test_authoritative_mapping_failure_degrades_readiness() -> None:
+    first, _, benchmark, candles, health = _scanner_fixture()
+    result = MarketScanner().scan(
+        instruments=(first,),
+        candles_by_instrument=candles,
+        health_by_instrument=health,
+        benchmark=benchmark,
+        baseline_store=FixedBaseline(),
+        now=BASE + timedelta(minutes=20),
+        reference_diagnostics=("BROKEN:missing_angel_mapping",),
+        requested_count=2,
+    )
+
+    assert result.readiness is ScannerReadiness.DEGRADED
+    assert result.mapping_failure_count == 1

@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
+from time import perf_counter
 
 from .broker import (
     AngelCredentials,
@@ -15,14 +16,24 @@ from .broker import (
     ReconnectPolicy,
 )
 from .config import Settings
-from .domain import IST, Exchange
-from .marketdata import MarketReplayEngine
+from .domain import IST, Exchange, MarketSubscription
+from .marketdata import (
+    Candle,
+    HistoricalBootstrapService,
+    MarketReplayEngine,
+    ReplaySafetyLimitExceeded,
+)
 from .reference_data import (
     NIFTY500_CONSTITUENTS_URL,
     Nifty500Cache,
     Nifty500CacheError,
 )
-from .reference_data.universe import resolve_nse_equity_universe
+from .reference_data.universe import (
+    ScannerSubscriptionError,
+    build_scanner_subscription_plan,
+    resolve_nse_equity_mappings,
+    resolve_nse_equity_universe,
+)
 from .scanner import MarketScanner, ScannerWeights
 from .storage import SQLiteMarketRecorder, TickIngestionService
 
@@ -38,6 +49,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "record-market",
         help="authenticate and record Angel One WebSocket market data (no orders)",
+    )
+    subparsers.add_parser(
+        "record-scanner-market",
+        help="record the validated local scanner universe plus NIFTY (no orders)",
     )
     subparsers.add_parser(
         "refresh-instruments",
@@ -61,6 +76,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     replay.add_argument("--date", required=True, type=_iso_date)
     replay.add_argument("--json", action="store_true", dest="json_output")
+    history = subparsers.add_parser(
+        "bootstrap-history",
+        help="explicitly bootstrap prior 1m/5m research history from SmartAPI",
+    )
+    history.add_argument("--force", action="store_true")
+    history.add_argument("--json", action="store_true", dest="json_output")
     scan = subparsers.add_parser(
         "scan", help="rank analysis-only LONG/SHORT attention candidates"
     )
@@ -80,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.1")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -98,6 +119,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "record-market":
         return _record_market(settings)
+
+    if command == "record-scanner-market":
+        return _record_scanner_market(settings)
 
     if command == "refresh-instruments":
         cache = _instrument_cache(settings)
@@ -135,6 +159,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "replay":
         return _replay(settings, args.date, json_output=args.json_output)
 
+    if command == "bootstrap-history":
+        return _bootstrap_history(
+            settings,
+            force=args.force,
+            json_output=args.json_output,
+        )
+
     if command == "scan":
         if args.limit < 1:
             raise ValueError("--limit must be positive")
@@ -149,6 +180,50 @@ def _record_market(settings: Settings) -> int:
     if not subscriptions:
         raise RuntimeError(
             "ANGEL_MARKET_SUBSCRIPTIONS is empty; no market data can be recorded"
+        )
+    return _record_subscriptions(
+        settings,
+        subscriptions,
+        description=f"{len(subscriptions)} diagnostic subscription(s)",
+    )
+
+
+def _record_scanner_market(settings: Settings) -> int:
+    now = datetime.now(IST)
+    instrument_cache = _instrument_cache(settings).load(now=now)
+    intraday_cache = _intraday_cache(settings).load(now=now)
+    nifty_cache = _nifty500_cache(settings).load(now=now)
+    plan = build_scanner_subscription_plan(
+        nifty_cache,
+        instrument_cache,
+        intraday_cache,
+        benchmark_trading_symbol=settings.nifty_benchmark_trading_symbol,
+        configured_symbols=settings.configured_scanner_symbols(),
+    )
+    print(
+        "Scanner subscriptions: "
+        f"requested={plan.requested_count} eligible={plan.eligible_count} "
+        f"expected_ineligible={plan.expected_ineligible_count} "
+        f"mapping_failures={plan.mapping_failure_count} "
+        f"benchmark={plan.benchmark_count} final={len(plan.subscriptions)}"
+    )
+    _require_credentials(settings)
+    return _record_subscriptions(
+        settings,
+        plan.subscriptions,
+        description=f"{len(plan.subscriptions)} scanner subscription(s)",
+    )
+
+
+def _record_subscriptions(
+    settings: Settings,
+    subscriptions: Sequence[MarketSubscription],
+    *,
+    description: str,
+) -> int:
+    if len(subscriptions) > 1_000:
+        raise ScannerSubscriptionError(
+            "market-data subscriptions exceed the 1000-token SmartAPI limit"
         )
     credentials = _credentials(settings)
     policy = ReconnectPolicy(
@@ -175,7 +250,7 @@ def _record_market(settings: Settings) -> int:
         )
         ingestion.start()
         print(
-            f"Recording {len(subscriptions)} subscription(s) in PAPER mode. "
+            f"Recording {description} in PAPER mode. "
             "Press Ctrl+C to stop."
         )
         try:
@@ -192,6 +267,67 @@ def _record_market(settings: Settings) -> int:
         if ingestion.failure is not None:
             raise ingestion.failure
     return 0
+
+
+def _bootstrap_history(
+    settings: Settings, *, force: bool, json_output: bool
+) -> int:
+    now = datetime.now(IST)
+    instrument_cache = _instrument_cache(settings).load(now=now)
+    nifty_cache = _nifty500_cache(settings).load(now=now)
+    mapped = resolve_nse_equity_mappings(
+        nifty_cache,
+        instrument_cache,
+        configured_symbols=settings.configured_scanner_symbols(),
+    )
+    if mapped.mapping_failures:
+        failures = ",".join(
+            f"{item.symbol}:{item.reason}" for item in mapped.mapping_failures
+        )
+        raise RuntimeError(f"historical symbol mapping failed closed: {failures}")
+    benchmark = instrument_cache.find_trading_symbol(
+        Exchange.NSE_CM, settings.nifty_benchmark_trading_symbol
+    )
+    if benchmark is None or benchmark.instrument_type != "AMXIDX":
+        raise RuntimeError("authoritative NIFTY benchmark mapping is unavailable")
+    _require_credentials(settings)
+    adapter = AngelOneMarketDataAdapter(_credentials(settings))
+    with _recorder(settings) as recorder:
+        service = HistoricalBootstrapService(
+            adapter,
+            recorder,
+            lookback_days=settings.historical_bootstrap_lookback_days,
+            minimum_sessions=settings.historical_bootstrap_minimum_sessions,
+            request_delay_seconds=settings.historical_request_delay_seconds,
+            max_attempts=settings.historical_request_max_attempts,
+            retry_initial_delay_seconds=(
+                settings.historical_retry_initial_delay_seconds
+            ),
+            retry_max_delay_seconds=settings.historical_retry_max_delay_seconds,
+        )
+        result = service.bootstrap(
+            mapped.instruments,
+            benchmark=benchmark,
+            now=now,
+            force=force,
+        )
+    payload = result.to_dict()
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            "Historical bootstrap: "
+            f"requested={result.requested_symbols} "
+            f"completed={result.completed_symbols} failed={result.failed_symbols} "
+            f"sessions={result.sessions_found} "
+            f"cache_age_seconds={result.cache_age_seconds}"
+        )
+        for item in result.symbols:
+            print(
+                f"  {item.symbol}: {item.status} sessions={item.sessions_found} "
+                f"cache_age_seconds={item.cache_age_seconds} reason={item.reason}"
+            )
+    return 0 if result.failed_symbols == 0 else 2
 
 
 def _data_status(settings: Settings, *, json_output: bool) -> int:
@@ -230,6 +366,8 @@ def _replay(settings: Settings, session_date: date, *, json_output: bool) -> int
         "completed_candles": len(result.candles),
         "trusted_candles": sum(candle.trusted for candle in result.candles),
         "instruments": len(result.health),
+        "raw_ticks_replayed": result.raw_ticks_replayed,
+        "ignored_future_ticks": result.ignored_future_ticks,
     }
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -256,30 +394,112 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
         benchmark = instrument_cache.find_trading_symbol(
             Exchange.NSE_CM, settings.nifty_benchmark_trading_symbol
         )
+        if benchmark is not None and benchmark.instrument_type != "AMXIDX":
+            benchmark = None
     except (InstrumentMasterError, IntradayUniverseError, Nifty500CacheError) as exc:
         payload = {
             "readiness": "NOT_READY",
             "market_regime": "UNKNOWN",
-            "diagnostics": [type(exc).__name__],
+            "diagnostics": {
+                "expected_eligibility_exclusions": [],
+                "reference_failures": [type(exc).__name__],
+                "unhealthy_market_data": [],
+                "indicator_not_ready": [],
+                "benchmark_failures": [],
+                "scaling_warnings": [],
+            },
             "analysis_only": True,
             "long_candidates": [],
             "short_candidates": [],
+            "requested_count": 0,
+            "eligible_count": 0,
+            "expected_ineligible_count": 0,
+            "mapping_failure_count": 1,
+            "indicator_not_ready_count": 0,
+            "benchmark_failure_count": 0,
+            "evaluated_count": 0,
+            "rejected_count": 0,
+            "unhealthy_count": 0,
+            "raw_ticks_replayed": 0,
+            "replay_elapsed_seconds": 0.0,
         }
         _print_scan_payload(payload, json_output=json_output, limit=limit)
         return 2
 
     with _recorder(settings) as recorder:
-        replay = _replay_engine(settings).replay_date(
-            recorder,
-            now.date(),
-            evaluation_at=now,
-            persist=False,
-        )
-        candles_by: dict[tuple[Exchange, str], list] = {}
-        for candle in replay.candles:
-            candles_by.setdefault((candle.exchange, candle.symbol_token), []).append(
-                candle
+        replay_started = perf_counter()
+        try:
+            replay = _replay_engine(settings).replay_date(
+                recorder,
+                now.date(),
+                evaluation_at=now,
+                persist=False,
+                hard_tick_limit=settings.scan_replay_hard_tick_limit,
             )
+        except ReplaySafetyLimitExceeded as exc:
+            payload = {
+                "readiness": "NOT_READY",
+                "market_regime": "UNKNOWN",
+                "diagnostics": {
+                    "expected_eligibility_exclusions": [],
+                    "reference_failures": [],
+                    "unhealthy_market_data": [],
+                    "indicator_not_ready": [],
+                    "benchmark_failures": [],
+                    "scaling_warnings": [
+                        "raw_tick_hard_limit_exceeded:"
+                        f"{exc.tick_count}>{exc.hard_limit}"
+                    ],
+                },
+                "analysis_only": True,
+                "long_candidates": [],
+                "short_candidates": [],
+                "requested_count": len(settings.configured_scanner_symbols())
+                or len(nifty_cache.constituents),
+                "eligible_count": len(universe.instruments),
+                "expected_ineligible_count": len(
+                    universe.expected_eligibility_exclusions
+                ),
+                "mapping_failure_count": len(universe.mapping_failures),
+                "indicator_not_ready_count": 0,
+                "benchmark_failure_count": 0,
+                "evaluated_count": 0,
+                "rejected_count": 0,
+                "unhealthy_count": 0,
+                "raw_ticks_replayed": exc.tick_count,
+                "replay_elapsed_seconds": round(
+                    perf_counter() - replay_started, 6
+                ),
+            }
+            _print_scan_payload(payload, json_output=json_output, limit=limit)
+            return 2
+        replay_elapsed = perf_counter() - replay_started
+        historical_start = datetime.combine(
+            now.date() - timedelta(days=settings.historical_bootstrap_lookback_days),
+            time.min,
+            tzinfo=IST,
+        )
+        persisted_candles = recorder.load_candles(
+            start_at=historical_start,
+            end_at=now,
+        )
+        candles_by_key: dict[
+            tuple[Exchange, str], dict[tuple[int, datetime], Candle]
+        ] = {}
+        for candle in persisted_candles:
+            candles_by_key.setdefault(
+                (candle.exchange, candle.symbol_token), {}
+            )[(int(candle.interval), candle.start_at)] = candle
+        for candle in replay.candles:
+            candles_by_key.setdefault(
+                (candle.exchange, candle.symbol_token), {}
+            )[(int(candle.interval), candle.start_at)] = candle
+        candles_by = {
+            key: sorted(
+                values.values(), key=lambda item: (item.start_at, item.interval)
+            )
+            for key, values in candles_by_key.items()
+        }
         health_by = {
             (health.exchange, health.symbol_token): health for health in replay.health
         }
@@ -304,6 +524,19 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             regime_momentum_threshold_pct=(settings.regime_momentum_threshold_pct),
             regime_slope_lookback_candles=(settings.regime_slope_lookback_candles),
         )
+        scaling_warnings: list[str] = []
+        if replay.raw_ticks_replayed > settings.scan_replay_warning_tick_count:
+            scaling_warnings.append(
+                "raw_tick_warning_threshold_exceeded:"
+                f"{replay.raw_ticks_replayed}>"
+                f"{settings.scan_replay_warning_tick_count}"
+            )
+        if replay_elapsed > settings.scan_replay_warning_seconds:
+            scaling_warnings.append(
+                "replay_runtime_warning_threshold_exceeded:"
+                f"{replay_elapsed:.6f}>"
+                f"{settings.scan_replay_warning_seconds}"
+            )
         result = scanner.scan(
             instruments=universe.instruments,
             candles_by_instrument=candles_by,
@@ -311,9 +544,18 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             benchmark=benchmark,
             baseline_store=recorder,
             now=now,
-            universe_diagnostics=[
-                f"{item.symbol}:{item.reason}" for item in universe.exclusions
+            expected_eligibility_diagnostics=[
+                f"{item.symbol}:{item.reason}"
+                for item in universe.expected_eligibility_exclusions
             ],
+            reference_diagnostics=[
+                f"{item.symbol}:{item.reason}" for item in universe.mapping_failures
+            ],
+            requested_count=len(settings.configured_scanner_symbols())
+            or len(nifty_cache.constituents),
+            raw_ticks_replayed=replay.raw_ticks_replayed,
+            replay_elapsed_seconds=round(replay_elapsed, 6),
+            scaling_warnings=scaling_warnings,
         )
     payload = result.to_dict()
     _print_scan_payload(payload, json_output=json_output, limit=limit)
@@ -333,6 +575,14 @@ def _print_scan_payload(
         f"Scanner readiness={payload['readiness']} "
         f"regime={payload['market_regime']} analysis_only=True"
     )
+    print(
+        f"requested={payload.get('requested_count', 0)} "
+        f"eligible={payload.get('eligible_count', 0)} "
+        f"expected_ineligible={payload.get('expected_ineligible_count', 0)} "
+        f"mapping_failures={payload.get('mapping_failure_count', 0)} "
+        f"raw_ticks_replayed={payload.get('raw_ticks_replayed', 0)} "
+        f"replay_elapsed_seconds={payload.get('replay_elapsed_seconds', 0.0)}"
+    )
     print("BIAS  SYMBOL              SCORE      LTP     RVOL       RS")
     for bias_key in ("long_candidates", "short_candidates"):
         for item in list(payload.get(bias_key, []))[:limit]:
@@ -341,7 +591,15 @@ def _print_scan_payload(
                 f"{item['total_score']:>5} {item['ltp']:>8} "
                 f"{item['relative_volume']:>8} {item['relative_strength']:>8}"
             )
-    diagnostics = list(payload.get("diagnostics", []))
+    raw_diagnostics = payload.get("diagnostics", {})
+    if isinstance(raw_diagnostics, dict):
+        diagnostics = [
+            f"{category}:{reason}"
+            for category, reasons in sorted(raw_diagnostics.items())
+            for reason in list(reasons)
+        ]
+    else:
+        diagnostics = list(raw_diagnostics)
     print(f"diagnostics={len(diagnostics)}")
     for reason in diagnostics[:10]:
         print(f"  {reason}")

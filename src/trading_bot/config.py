@@ -60,6 +60,15 @@ class Settings(BaseSettings):
 
     scanner_symbols: str = ""
     nifty_benchmark_trading_symbol: str = "NIFTY 50"
+    historical_bootstrap_lookback_days: int = Field(default=30, ge=22, le=30)
+    historical_bootstrap_minimum_sessions: int = Field(default=15, ge=1, le=25)
+    historical_request_delay_seconds: float = Field(default=0.5, ge=0.1, le=10)
+    historical_request_max_attempts: int = Field(default=3, ge=1, le=5)
+    historical_retry_initial_delay_seconds: float = Field(default=1.0, ge=0, le=60)
+    historical_retry_max_delay_seconds: float = Field(default=8.0, ge=0, le=120)
+    scan_replay_warning_tick_count: int = Field(default=500_000, ge=1)
+    scan_replay_warning_seconds: float = Field(default=10.0, gt=0, le=3600)
+    scan_replay_hard_tick_limit: int = Field(default=2_000_000, ge=1)
     market_data_recovery_consecutive_ticks: int = Field(default=3, ge=1, le=100)
     market_data_allowed_sequence_gap: int = Field(default=0, ge=0, le=100)
     relative_volume_lookback_sessions: int = Field(default=15, ge=1, le=100)
@@ -150,6 +159,24 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "relative volume minimum sessions cannot exceed lookback sessions"
+            )
+        if (
+            self.historical_bootstrap_minimum_sessions
+            > self.historical_bootstrap_lookback_days
+        ):
+            raise ValueError(
+                "historical minimum sessions cannot exceed lookback calendar days"
+            )
+        if (
+            self.historical_retry_initial_delay_seconds
+            > self.historical_retry_max_delay_seconds
+        ):
+            raise ValueError(
+                "historical retry initial delay cannot exceed maximum delay"
+            )
+        if self.scan_replay_warning_tick_count > self.scan_replay_hard_tick_limit:
+            raise ValueError(
+                "scan replay warning tick count cannot exceed the hard tick limit"
             )
         return self
 

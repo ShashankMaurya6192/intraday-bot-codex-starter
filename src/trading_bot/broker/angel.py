@@ -77,6 +77,10 @@ class _RestClient(Protocol):
 
     def nseIntraday(self) -> Mapping[str, Any]: ...
 
+    def getCandleData(
+        self, historicDataParams: Mapping[str, object]
+    ) -> Mapping[str, Any]: ...
+
 
 class _WebSocketClient(Protocol):
     on_open: Callable[..., None]
@@ -339,6 +343,28 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         if not isinstance(response, Mapping):
             raise BrokerReferenceDataError(
                 "Angel NSE intraday-universe response is malformed"
+            )
+        return response
+
+    def fetch_historical_candles(
+        self, parameters: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        """Call the official SDK's authenticated historical POST endpoint."""
+        if self._session is None or self._rest_client is None:
+            self.authenticate()
+        client = self._rest_client
+        if client is None:
+            raise BrokerReferenceDataError("Angel REST session is unavailable")
+        try:
+            # SmartAPI mutates its parameter dictionary while removing None values.
+            response = client.getCandleData(dict(parameters))
+        except Exception as exc:
+            raise BrokerReferenceDataError(
+                "Angel historical-candle request failed"
+            ) from exc
+        if not isinstance(response, Mapping):
+            raise BrokerReferenceDataError(
+                "Angel historical-candle response is malformed"
             )
         return response
 

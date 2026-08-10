@@ -153,11 +153,16 @@ def _parse_response(response: Mapping[str, object]) -> list[IntradayAllowedRecor
     for index, row in enumerate(data):
         if not isinstance(row, Mapping):
             raise IntradayUniverseError(f"intraday row {index} is malformed")
-        exchange = row.get("Exchange", "NSE")
-        if exchange != "NSE":
+        exchange = _compatible_field(row, "exchange", "Exchange")
+        if not isinstance(exchange, str) or exchange.strip().upper() != "NSE":
             raise IntradayUniverseError(f"intraday row {index} is not an NSE record")
-        symbol = row.get("SymbolName", row.get("symbol"))
-        multiplier = row.get("Multiplier", row.get("multiplier"))
+        symbol = _compatible_field(row, "symbol", "SymbolName")
+        try:
+            multiplier = _compatible_field(row, "multiplier", "Multiplier")
+        except IntradayUniverseError as exc:
+            raise IntradayUniverseError(
+                f"intraday row {index} has an invalid multiplier"
+            ) from exc
         if not isinstance(symbol, str):
             raise IntradayUniverseError(f"intraday row {index} has no symbol")
         try:
@@ -168,6 +173,25 @@ def _parse_response(response: Mapping[str, object]) -> list[IntradayAllowedRecor
             ) from exc
     _unique(records)
     return records
+
+
+def _compatible_field(
+    row: Mapping[str, object], documented_key: str, compatibility_key: str
+) -> object:
+    documented_present = documented_key in row
+    compatibility_present = compatibility_key in row
+    if not documented_present and not compatibility_present:
+        raise IntradayUniverseError(
+            f"intraday row is missing required field {documented_key}"
+        )
+    if documented_present and compatibility_present:
+        documented = row[documented_key]
+        compatibility = row[compatibility_key]
+        if str(documented).strip().upper() != str(compatibility).strip().upper():
+            raise IntradayUniverseError(
+                f"intraday row has conflicting field {documented_key}"
+            )
+    return row[documented_key] if documented_present else row[compatibility_key]
 
 
 def _from_cache(row: object) -> IntradayAllowedRecord:

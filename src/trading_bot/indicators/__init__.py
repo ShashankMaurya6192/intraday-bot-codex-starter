@@ -9,6 +9,7 @@ from .core import (
     opening_range,
     relative_strength,
     relative_volume,
+    session_twap,
     session_vwap,
     vwap_distance,
 )
@@ -25,5 +26,6 @@ __all__ = [
     "relative_strength",
     "relative_volume",
     "session_vwap",
+    "session_twap",
     "vwap_distance",
 ]

@@ -102,6 +102,43 @@ class ScannerCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class ScannerDiagnostics:
+    expected_eligibility_exclusions: tuple[str, ...] = ()
+    reference_failures: tuple[str, ...] = ()
+    unhealthy_market_data: tuple[str, ...] = ()
+    indicator_not_ready: tuple[str, ...] = ()
+    benchmark_failures: tuple[str, ...] = ()
+    scaling_warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, list[str]]:
+        return {
+            "expected_eligibility_exclusions": list(
+                self.expected_eligibility_exclusions
+            ),
+            "reference_failures": list(self.reference_failures),
+            "unhealthy_market_data": list(self.unhealthy_market_data),
+            "indicator_not_ready": list(self.indicator_not_ready),
+            "benchmark_failures": list(self.benchmark_failures),
+            "scaling_warnings": list(self.scaling_warnings),
+        }
+
+    @property
+    def all_messages(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    *self.expected_eligibility_exclusions,
+                    *self.reference_failures,
+                    *self.unhealthy_market_data,
+                    *self.indicator_not_ready,
+                    *self.benchmark_failures,
+                    *self.scaling_warnings,
+                }
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ScannerResult:
     readiness: ScannerReadiness
     market_regime: MarketRegime
@@ -110,7 +147,15 @@ class ScannerResult:
     evaluated_count: int
     rejected_count: int
     unhealthy_count: int
-    diagnostics: tuple[str, ...]
+    requested_count: int
+    eligible_count: int
+    expected_ineligible_count: int
+    mapping_failure_count: int
+    indicator_not_ready_count: int
+    benchmark_failure_count: int
+    raw_ticks_replayed: int
+    replay_elapsed_seconds: float
+    diagnostics: ScannerDiagnostics
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -121,6 +166,14 @@ class ScannerResult:
             "evaluated_count": self.evaluated_count,
             "rejected_count": self.rejected_count,
             "unhealthy_count": self.unhealthy_count,
-            "diagnostics": list(self.diagnostics),
+            "requested_count": self.requested_count,
+            "eligible_count": self.eligible_count,
+            "expected_ineligible_count": self.expected_ineligible_count,
+            "mapping_failure_count": self.mapping_failure_count,
+            "indicator_not_ready_count": self.indicator_not_ready_count,
+            "benchmark_failure_count": self.benchmark_failure_count,
+            "raw_ticks_replayed": self.raw_ticks_replayed,
+            "replay_elapsed_seconds": self.replay_elapsed_seconds,
+            "diagnostics": self.diagnostics.to_dict(),
             "analysis_only": True,
         }

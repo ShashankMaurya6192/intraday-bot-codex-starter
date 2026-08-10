@@ -38,6 +38,7 @@ class FakeRestClient:
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
         self.login_args: tuple[str, str, str] | None = None
+        self.historical_parameters: dict[str, object] | None = None
 
     def generateSession(
         self, client_code: str, password: str, totp: str
@@ -53,6 +54,11 @@ class FakeRestClient:
             "status": True,
             "data": [{"Exchange": "NSE", "SymbolName": "SBIN", "Multiplier": "5"}],
         }
+
+    def getCandleData(self, parameters: dict[str, object]) -> dict[str, Any]:
+        self.historical_parameters = parameters
+        parameters.pop("optional", None)
+        return {"status": True, "data": []}
 
 
 class FakeWebSocket:
@@ -179,6 +185,31 @@ def test_authenticated_intraday_reference_request_has_no_order_capability() -> N
     assert response["status"] is True
     assert not hasattr(adapter, "place_order")
     assert not hasattr(adapter, "cancel_order")
+
+
+def test_historical_request_uses_sdk_without_mutating_input() -> None:
+    rest = FakeRestClient(_session_response())
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        totp_provider=lambda _secret: "123456",
+        clock=lambda: FIXED_NOW,
+    )
+    parameters = {
+        "exchange": "NSE",
+        "symboltoken": "3045",
+        "interval": "ONE_MINUTE",
+        "fromdate": "2026-07-10 09:15",
+        "todate": "2026-08-07 15:30",
+        "optional": None,
+    }
+
+    response = adapter.fetch_historical_candles(parameters)
+
+    assert response["status"] is True
+    assert rest.historical_parameters is not parameters
+    assert parameters["optional"] is None
+    assert not hasattr(adapter, "place_order")
 
 
 def test_sdk_log_filter_redacts_known_secrets_and_auth_headers() -> None:

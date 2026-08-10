@@ -3,11 +3,11 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2 adds validated reference-data caches, tick health and sequence epochs,
-IST-aligned one/five-minute candles, deterministic replay, indicators, NIFTY
-regime classification, and explainable LONG/SHORT attention rankings. Scanner
-results are analysis only. There is no paper execution, order interface, or live
-order-placement code.
+Phase 2.1 hardens validated reference-data caches, strictly causal as-of replay,
+session/rolling indicator boundaries, zero-volume NIFTY regime classification,
+explicit historical bootstrap, automatic scanner-universe recording, and
+explainable LONG/SHORT attention rankings. Scanner results are analysis only.
+There is no paper execution, order interface, or live order-placement code.
 
 ## Safety status
 
@@ -15,8 +15,9 @@ order-placement code.
 - No command confirms or enables LIVE mode.
 - `.env`, SQLite databases, and `data/cache/` are gitignored.
 - Credentials use secret settings and are never written to reference caches.
-- The Angel adapter can authenticate, read market data, and read the official
-  intraday-allowed list. It cannot place, modify, cancel, or query orders.
+- The Angel adapter can authenticate, read live/historical market data, and read
+  the official intraday-allowed list. It cannot place, modify, cancel, or query
+  orders.
 - The production WebSocket verifies certificates and hostnames.
 - Reconnects, downloads, queues, and shutdown drains are bounded.
 - Missing, stale, corrupt, ambiguous, sequence-broken, or incomplete data
@@ -90,13 +91,15 @@ python -m trading_bot data-status --json
   intraday-allowed symbol/multiplier snapshot. Run it before or near each market
   session. The multiplier is retained as broker metadata and never used to
   increase strategy risk.
-- `refresh-nifty500` downloads the official NSE Indices constituent CSV.
+- `refresh-nifty500` downloads the CSV linked by the current NSE NIFTY 500
+  product page from `nsearchives.nseindia.com`, with
+  `archives.nseindia.com` as an official HTTPS fallback.
 
 If the NSE Indices host is unavailable, download the authoritative CSV and use
 the explicit local import path:
 
 ```powershell
-Invoke-WebRequest -Uri "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv" -OutFile ".\ind_nifty500list.csv"
+Invoke-WebRequest -Uri "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv" -OutFile ".\ind_nifty500list.csv"
 python -m trading_bot refresh-nifty500 --source .\ind_nifty500list.csv
 ```
 
@@ -134,6 +137,23 @@ Record during the market session:
 python -m trading_bot record-market
 ```
 
+For the intended scanner, derive every token from fresh local caches and add the
+authoritative NIFTY 50 benchmark automatically:
+
+```powershell
+python -m trading_bot refresh-instruments
+python -m trading_bot refresh-nifty500
+python -m trading_bot refresh-intraday-universe
+python -m trading_bot record-scanner-market
+```
+
+`record-scanner-market` performs no downloads. Before authentication it prints
+requested, eligible, expected-ineligible, mapping-failure, benchmark, and final
+subscription counts and enforces the one-socket 1,000-token limit. The benchmark
+is added exactly once and does not need equity intraday eligibility. Stale or
+missing caches and an invalid benchmark mapping fail closed. Keep
+`record-market` for manual diagnostic subscriptions.
+
 Replay a recorded session and idempotently persist completed candles:
 
 ```powershell
@@ -148,6 +168,33 @@ python -m trading_bot scan
 python -m trading_bot scan --limit 20
 python -m trading_bot scan --json --limit 20
 ```
+
+Bootstrap prior research history explicitly before expecting early-session
+EMA/ATR/RVOL readiness. This command never runs from `record-market`,
+`record-scanner-market`, or `scan`:
+
+```powershell
+notepad .env
+python -m trading_bot bootstrap-history
+python -m trading_bot bootstrap-history --json
+python -m trading_bot bootstrap-history --force
+```
+
+For the initial smoke test, set 5-20 symbols by name—never token ID—in `.env`:
+
+```dotenv
+SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
+```
+
+`bootstrap-history` authenticates the official SmartAPI Python SDK, calls its
+authenticated `POST /rest/secure/angelbroking/historical/v1/getCandleData`
+Historical API with `ONE_MINUTE`, conservatively throttles and retries, validates
+every row, requires complete 09:15-15:30 sessions, derives five-minute candles
+locally, and atomically stores normalized history in SQLite. The default 30
+calendar-day request targets at least 15 complete prior sessions. Complete
+equity sessions create RVOL baselines; NIFTY never does. A rerun skips current
+per-symbol datasets, while `--force` intentionally refreshes them. A malformed
+or partial response cannot replace the previous valid symbol dataset.
 
 The default universe is the intersection of:
 
@@ -170,6 +217,10 @@ with a diagnostic rather than assigned a guessed token.
 explicit refresh commands
   -> validated atomic Angel/NIFTY caches
 
+explicit SmartAPI historical bootstrap
+  -> validated complete 1m sessions
+  -> local 5m warm-up candles + equity-only RVOL baselines
+
 recorded SmartAPI ticks
   -> feed-epoch health/sequence monitor
   -> deterministic 09:15 IST candle aggregation
@@ -183,8 +234,8 @@ recorded SmartAPI ticks
 - `trading_bot.broker.instruments`: concrete Angel master and authoritative
   instrument identity validation.
 - `trading_bot.broker.intraday`: current-date Angel NSE intraday snapshot.
-- `trading_bot.marketdata`: tick health, reconnect epochs, candles, replay, and
-  market regime.
+- `trading_bot.marketdata`: tick health, reconnect epochs, candles, causal
+  replay, historical bootstrap, and market regime.
 - `trading_bot.indicators`: pure indicator functions with explicit warm-ups.
 - `trading_bot.scanner`: deterministic candidate scoring, diagnostics, and JSON.
 - `trading_bot.storage`: ticks, feed events, candles, and RVOL baselines in SQLite.
@@ -192,14 +243,22 @@ recorded SmartAPI ticks
 ## Data-health meanings
 
 - `READY`: all required caches are current; NIFTY and every ranked instrument
-  have trusted, fresh data and all required indicators are warmed up.
-- `DEGRADED`: reference boundaries are valid but one or more universe members
-  are stale, untrusted, unmapped, excluded, or indicator-incomplete. Any shown
-  ranking is partial and must not be treated as executable.
+  have trusted, fresh data and all required indicators are warmed up. Expected
+  current intraday ineligibility alone does not change this state.
+- `DEGRADED`: one or more eligible instruments are stale/untrusted or
+  indicator-incomplete, or an authoritative equity mapping is missing or
+  ambiguous. Any shown ranking is partial and must not be treated as executable.
 - `NOT_READY`: a required cache/universe/benchmark is unavailable or stale, or
   the scanner cannot form a trustworthy market view.
-- `UNKNOWN`: the market-regime value when NIFTY is stale/untrusted or VWAP,
-  EMA, or slope history is not ready. `UNKNOWN` prevents scanner readiness.
+- `UNKNOWN`: the market-regime value when NIFTY is stale/untrusted or its
+  non-volume session anchor, EMA, or slope history is not ready. `UNKNOWN`
+  prevents scanner readiness.
+
+JSON diagnostics are split deterministically into expected eligibility
+exclusions, reference failures, unhealthy market data, indicator NOT_READY,
+benchmark failures, and scaling warnings. Counts distinguish requested,
+eligible, expected-ineligible, broken mappings, indicator failures, and
+benchmark failures.
 
 Ticks become stale after `MARKET_DATA_STALE_AFTER_SECONDS` (default 5). Sequence
 duplicates are ignored; out-of-order ticks cannot mutate candles. Any sequence
@@ -217,18 +276,27 @@ trusted state. A candle touched by untrusted ticks remains untrusted.
   fabricated volume.
 - Session VWAP uses completed/trusted candles and typical price
   `(high + low + close) / 3`, weighted by incremental candle volume.
+- NIFTY regime uses a separate session TWAP: the arithmetic mean of completed,
+  trusted five-minute typical prices. NIFTY volume may remain zero and is never
+  fabricated or passed to stock VWAP/RVOL logic.
 - EMA 9/20 is seeded with the first period's simple mean.
 - ATR 14 is the simple average of 14 true ranges and requires 15 candles so each
   range has a prior close.
 - RVOL compares cumulative volume at the same session minute against up to 15
   prior complete/trusted local sessions and requires 10 by default.
 - Relative strength is stock session return minus NIFTY session return, in
-  percentage points.
+  percentage points. Both trusted current sessions must begin at 09:15; a
+  midday first observation is never treated as the session open.
 - VWAP distance is reported in percentage and ATR units.
 - Opening range is the trusted high/low over a complete, contiguous first 15
   session minutes by default.
+- VWAP, opening range, RVOL and relative strength use only today's session.
+  EMA9/EMA20, ATR14 and benchmark EMA warm-up may use prior complete/trusted
+  five-minute sessions plus today's completed candles. Sorting across sessions
+  preserves the previous close and therefore the overnight ATR gap.
 - Regime is `TREND_UP`, `TREND_DOWN`, `RANGE`, or `UNKNOWN`, using NIFTY relative
-  to VWAP, five-minute EMA 9/20, and short-horizon slope. No breadth is invented.
+  to its session TWAP, rolling five-minute EMA 9/20, and short-horizon slope. No
+  breadth or index volume is invented.
 
 ## Scanner scoring
 
@@ -269,6 +337,13 @@ unsafe and stops it.
 credential-free pytest suite.
 
 ## Phase 3 remains unimplemented
+
+Each as-of scan first counts raw ticks without loading them, rejects a count over
+`SCAN_REPLAY_HARD_TICK_LIMIT`, and reports raw ticks replayed plus replay elapsed
+time. Configurable tick/runtime warnings make current replay cost visible. This
+bounded replay remains a Phase 2.1 bridge: an incremental live intelligence
+worker with persisted health/candle snapshots is the next scaling step before
+any live automation.
 
 Phase 3 may add deterministic paper execution, fill simulation assumptions,
 position/risk state, protective exits, restart recovery, and kill-switch tests.

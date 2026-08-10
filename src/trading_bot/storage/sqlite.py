@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable
-from datetime import date, datetime
+from collections.abc import Iterable, Sequence
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import unquote
 
+from trading_bot.broker.instruments import BrokerInstrument
 from trading_bot.domain import (
     IST,
     Exchange,
@@ -20,6 +21,7 @@ from trading_bot.domain import (
     SubscriptionMode,
 )
 from trading_bot.marketdata import Candle, CandleInterval
+from trading_bot.marketdata.history import HistoricalBootstrapStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -101,6 +103,20 @@ CREATE INDEX IF NOT EXISTS idx_rvol_baseline_lookup
     ON relative_volume_baselines (
         exchange, symbol_token, minute_offset, session_date DESC
     );
+
+CREATE TABLE IF NOT EXISTS historical_bootstrap_status (
+    exchange TEXT NOT NULL,
+    symbol_token TEXT NOT NULL,
+    trading_symbol TEXT NOT NULL,
+    from_date TEXT NOT NULL,
+    through_date TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    sessions_found INTEGER NOT NULL CHECK (sessions_found > 0),
+    one_minute_candles INTEGER NOT NULL CHECK (one_minute_candles > 0),
+    five_minute_candles INTEGER NOT NULL CHECK (five_minute_candles > 0),
+    source_sha256 TEXT NOT NULL,
+    PRIMARY KEY (exchange, symbol_token)
+);
 """
 
 
@@ -142,6 +158,13 @@ class SQLiteMarketRecorder:
                 VALUES (?, ?)
                 """,
                 (2, datetime.now(IST).isoformat()),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_version(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (3, datetime.now(IST).isoformat()),
             )
             self._connection.commit()
 
@@ -190,6 +213,7 @@ class SQLiteMarketRecorder:
         symbol_token: str | None = None,
         start_at: datetime | None = None,
         end_at: datetime | None = None,
+        received_at_or_before: datetime | None = None,
         received_order: bool = False,
         limit: int | None = None,
     ) -> list[MarketTick]:
@@ -209,6 +233,9 @@ class SQLiteMarketRecorder:
         if end_at is not None:
             clauses.append("exchange_timestamp < ?")
             parameters.append(_aware_iso(end_at))
+        if received_at_or_before is not None:
+            clauses.append("received_at <= ?")
+            parameters.append(_aware_iso(received_at_or_before))
 
         sql = "SELECT * FROM market_ticks"
         if clauses:
@@ -357,6 +384,171 @@ class SQLiteMarketRecorder:
             ).fetchall()
         return tuple(int(row["cumulative_volume"]) for row in rows)
 
+    def load_historical_bootstrap_status(
+        self, *, exchange: Exchange, symbol_token: str
+    ) -> HistoricalBootstrapStatus | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM historical_bootstrap_status
+                WHERE exchange = ? AND symbol_token = ?
+                """,
+                (exchange.value, symbol_token),
+            ).fetchone()
+        if row is None:
+            return None
+        return HistoricalBootstrapStatus(
+            exchange=Exchange(row["exchange"]),
+            symbol_token=row["symbol_token"],
+            trading_symbol=row["trading_symbol"],
+            from_date=date.fromisoformat(row["from_date"]),
+            through_date=date.fromisoformat(row["through_date"]),
+            fetched_at=datetime.fromisoformat(row["fetched_at"]),
+            sessions_found=row["sessions_found"],
+            one_minute_candles=row["one_minute_candles"],
+            five_minute_candles=row["five_minute_candles"],
+            source_sha256=row["source_sha256"],
+        )
+
+    def replace_historical_dataset(
+        self,
+        *,
+        instrument: BrokerInstrument,
+        one_minute_candles: Sequence[Candle],
+        five_minute_candles: Sequence[Candle],
+        complete_session_dates: Sequence[date],
+        from_date: date,
+        through_date: date,
+        fetched_at: datetime,
+        source_sha256: str,
+        build_rvol_baselines: bool,
+    ) -> HistoricalBootstrapStatus:
+        """Atomically replace one fully validated broker-history dataset."""
+        if not one_minute_candles or not five_minute_candles:
+            raise ValueError("historical dataset must contain 1m and 5m candles")
+        if not complete_session_dates or from_date > through_date:
+            raise ValueError("historical session/date bounds are invalid")
+        if len(source_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in source_sha256.lower()
+        ):
+            raise ValueError("source_sha256 must be a SHA-256 digest")
+        fetched_iso = _aware_iso(fetched_at)
+        session_dates = tuple(sorted(set(complete_session_dates)))
+        if any(not from_date <= item <= through_date for item in session_dates):
+            raise ValueError("historical sessions fall outside requested date bounds")
+        all_candles = tuple(one_minute_candles) + tuple(five_minute_candles)
+        for candle in all_candles:
+            if (
+                candle.exchange is not instrument.exchange
+                or candle.symbol_token != instrument.symbol_token
+                or candle.start_at.date() not in session_dates
+                or not candle.completed
+                or not candle.trusted
+            ):
+                raise ValueError("historical candle identity/trust is inconsistent")
+        range_start = datetime.combine(from_date, time.min, tzinfo=IST).isoformat()
+        range_end = datetime.combine(
+            through_date + timedelta(days=1), time.min, tzinfo=IST
+        ).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                DELETE FROM market_candles
+                WHERE exchange = ? AND symbol_token = ?
+                  AND start_at >= ? AND start_at < ?
+                """,
+                (
+                    instrument.exchange.value,
+                    instrument.symbol_token,
+                    range_start,
+                    range_end,
+                ),
+            )
+            for candle in all_candles:
+                self._connection.execute(_INSERT_CANDLE, _candle_values(candle))
+            self._connection.execute(
+                """
+                DELETE FROM relative_volume_baselines
+                WHERE exchange = ? AND symbol_token = ?
+                  AND session_date >= ? AND session_date <= ?
+                """,
+                (
+                    instrument.exchange.value,
+                    instrument.symbol_token,
+                    from_date.isoformat(),
+                    through_date.isoformat(),
+                ),
+            )
+            if build_rvol_baselines:
+                grouped: dict[date, list[Candle]] = {}
+                for candle in one_minute_candles:
+                    grouped.setdefault(candle.start_at.date(), []).append(candle)
+                baseline_rows: list[tuple[object, ...]] = []
+                for session_date in session_dates:
+                    items = sorted(
+                        grouped.get(session_date, ()), key=lambda item: item.start_at
+                    )
+                    if len(items) != 375:
+                        raise ValueError("RVOL history requires complete 1m sessions")
+                    cumulative = 0
+                    for minute_offset, candle in enumerate(items):
+                        cumulative += candle.volume
+                        baseline_rows.append(
+                            (
+                                instrument.exchange.value,
+                                instrument.symbol_token,
+                                session_date.isoformat(),
+                                minute_offset,
+                                cumulative,
+                            )
+                        )
+                self._connection.executemany(
+                    """
+                    INSERT INTO relative_volume_baselines(
+                        exchange, symbol_token, session_date,
+                        minute_offset, cumulative_volume
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    baseline_rows,
+                )
+            self._connection.execute(
+                """
+                INSERT INTO historical_bootstrap_status(
+                    exchange, symbol_token, trading_symbol, from_date,
+                    through_date, fetched_at, sessions_found,
+                    one_minute_candles, five_minute_candles, source_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exchange, symbol_token) DO UPDATE SET
+                    trading_symbol = excluded.trading_symbol,
+                    from_date = excluded.from_date,
+                    through_date = excluded.through_date,
+                    fetched_at = excluded.fetched_at,
+                    sessions_found = excluded.sessions_found,
+                    one_minute_candles = excluded.one_minute_candles,
+                    five_minute_candles = excluded.five_minute_candles,
+                    source_sha256 = excluded.source_sha256
+                """,
+                (
+                    instrument.exchange.value,
+                    instrument.symbol_token,
+                    instrument.trading_symbol,
+                    from_date.isoformat(),
+                    through_date.isoformat(),
+                    fetched_iso,
+                    len(session_dates),
+                    len(one_minute_candles),
+                    len(five_minute_candles),
+                    source_sha256.lower(),
+                ),
+            )
+        status = self.load_historical_bootstrap_status(
+            exchange=instrument.exchange,
+            symbol_token=instrument.symbol_token,
+        )
+        if status is None:
+            raise RuntimeError("historical bootstrap status was not persisted")
+        return status
+
     def load_feed_events(self, *, limit: int | None = None) -> list[FeedEvent]:
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
@@ -377,11 +569,29 @@ class SQLiteMarketRecorder:
             for row in rows
         ]
 
-    def count_ticks(self) -> int:
+    def count_ticks(
+        self,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        received_at_or_before: datetime | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if start_at is not None:
+            clauses.append("exchange_timestamp >= ?")
+            parameters.append(_aware_iso(start_at))
+        if end_at is not None:
+            clauses.append("exchange_timestamp < ?")
+            parameters.append(_aware_iso(end_at))
+        if received_at_or_before is not None:
+            clauses.append("received_at <= ?")
+            parameters.append(_aware_iso(received_at_or_before))
+        sql = "SELECT COUNT(*) AS count FROM market_ticks"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         with self._lock:
-            row = self._connection.execute(
-                "SELECT COUNT(*) AS count FROM market_ticks"
-            ).fetchone()
+            row = self._connection.execute(sql, parameters).fetchone()
         return int(row["count"])
 
     def close(self) -> None:

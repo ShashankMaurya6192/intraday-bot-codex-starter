@@ -30,6 +30,7 @@ from trading_bot.marketdata import (
 from .models import (
     CandidateBias,
     ScannerCandidate,
+    ScannerDiagnostics,
     ScannerReadiness,
     ScannerResult,
     ScannerWeights,
@@ -83,13 +84,22 @@ class MarketScanner:
         benchmark: BrokerInstrument | None,
         baseline_store: RelativeVolumeBaselineReader,
         now: datetime,
-        universe_diagnostics: Sequence[str] = (),
+        expected_eligibility_diagnostics: Sequence[str] = (),
+        reference_diagnostics: Sequence[str] = (),
+        requested_count: int | None = None,
         caches_ready: bool = True,
+        raw_ticks_replayed: int = 0,
+        replay_elapsed_seconds: float = 0.0,
+        scaling_warnings: Sequence[str] = (),
     ) -> ScannerResult:
         now_ist = _aware(now)
-        diagnostics = list(universe_diagnostics)
+        eligibility_diagnostics = list(expected_eligibility_diagnostics)
+        reference_failures = list(reference_diagnostics)
+        market_data_failures: list[str] = []
+        indicator_failures: list[str] = []
+        benchmark_failures: list[str] = []
         if not caches_ready:
-            diagnostics.append("required_reference_cache_not_ready")
+            reference_failures.append("required_reference_cache_not_ready")
         benchmark_key = (
             (benchmark.exchange, benchmark.symbol_token) if benchmark else None
         )
@@ -108,19 +118,37 @@ class MarketScanner:
             benchmark_health,
             momentum_threshold_pct=self._regime_momentum,
             slope_lookback_candles=self._regime_slope,
+            session_date=now_ist.date(),
+            evaluation_at=now_ist,
         )
         if benchmark is None:
-            diagnostics.append("authoritative_nifty_benchmark_mapping_missing")
+            benchmark_failures.append("authoritative_nifty_benchmark_mapping_missing")
+        elif benchmark_health is None:
+            benchmark_failures.append("nifty_benchmark_market_data_missing")
+        elif not benchmark_health.trusted:
+            benchmark_failures.append("nifty_benchmark_market_data_untrusted")
         if regime is MarketRegime.UNKNOWN:
-            diagnostics.append("nifty_market_regime_unknown")
+            benchmark_failures.append("nifty_market_regime_unknown")
 
         long_candidates: list[ScannerCandidate] = []
         short_candidates: list[ScannerCandidate] = []
         rejected = 0
         unhealthy = 0
-        benchmark_one_minute = _interval(benchmark_candles, CandleInterval.ONE_MINUTE)
+        benchmark_one_minute = _interval(
+            benchmark_candles,
+            CandleInterval.ONE_MINUTE,
+            session_date=now_ist.date(),
+            evaluation_at=now_ist,
+        )
+        benchmark_has_session_open = _starts_at_session_open(
+            benchmark_one_minute, now_ist.date()
+        )
+        if benchmark is not None and not benchmark_has_session_open:
+            benchmark_failures.append("nifty_benchmark_session_open_not_ready")
         benchmark_open = (
-            benchmark_one_minute[0].open_price if benchmark_one_minute else None
+            benchmark_one_minute[0].open_price
+            if benchmark_has_session_open
+            else None
         )
         benchmark_current = (
             benchmark_one_minute[-1].close_price if benchmark_one_minute else None
@@ -132,15 +160,26 @@ class MarketScanner:
             if health is None or not health.trusted:
                 rejected += 1
                 unhealthy += 1
-                diagnostics.append(f"{instrument.trading_symbol}:market_data_untrusted")
+                market_data_failures.append(
+                    f"{instrument.trading_symbol}:market_data_untrusted"
+                )
                 continue
             candles = list(candles_by_instrument.get(key, ()))
-            one_minute = _interval(candles, CandleInterval.ONE_MINUTE)
-            five_minute = _interval(candles, CandleInterval.FIVE_MINUTES)
+            one_minute = _interval(
+                candles,
+                CandleInterval.ONE_MINUTE,
+                session_date=now_ist.date(),
+                evaluation_at=now_ist,
+            )
+            rolling_five_minute = _interval(
+                candles,
+                CandleInterval.FIVE_MINUTES,
+                evaluation_at=now_ist,
+            )
             readiness = self._indicator_values(
                 instrument=instrument,
                 one_minute=one_minute,
-                five_minute=five_minute,
+                rolling_five_minute=rolling_five_minute,
                 benchmark_open=benchmark_open,
                 benchmark_current=benchmark_current,
                 baseline_store=baseline_store,
@@ -148,14 +187,15 @@ class MarketScanner:
             )
             if isinstance(readiness, tuple):
                 rejected += 1
-                diagnostics.extend(
+                indicator_failures.extend(
                     f"{instrument.trading_symbol}:{reason}" for reason in readiness
                 )
                 continue
             values = readiness
             if regime is MarketRegime.UNKNOWN:
                 rejected += 1
-                diagnostics.append(f"{instrument.trading_symbol}:market_regime_unknown")
+                # The benchmark-level failure is enough; avoid duplicating it once
+                # per equity in deterministic output.
                 continue
             long_candidates.append(
                 self._candidate(CandidateBias.LONG, instrument, health, regime, values)
@@ -171,11 +211,23 @@ class MarketScanner:
             not caches_ready
             or benchmark is None
             or regime is MarketRegime.UNKNOWN
+            or benchmark_failures
             or not instruments
         ):
             readiness_status = ScannerReadiness.NOT_READY
-        elif rejected or diagnostics:
+        elif reference_failures or market_data_failures or indicator_failures:
             readiness_status = ScannerReadiness.DEGRADED
+        diagnostics = ScannerDiagnostics(
+            expected_eligibility_exclusions=tuple(
+                sorted(set(eligibility_diagnostics))
+            ),
+            reference_failures=tuple(sorted(set(reference_failures))),
+            unhealthy_market_data=tuple(sorted(set(market_data_failures))),
+            indicator_not_ready=tuple(sorted(set(indicator_failures))),
+            benchmark_failures=tuple(sorted(set(benchmark_failures))),
+            scaling_warnings=tuple(sorted(set(scaling_warnings))),
+        )
+        requested = requested_count if requested_count is not None else len(instruments)
         return ScannerResult(
             readiness=readiness_status,
             market_regime=regime,
@@ -184,7 +236,15 @@ class MarketScanner:
             evaluated_count=len(instruments),
             rejected_count=rejected,
             unhealthy_count=unhealthy,
-            diagnostics=tuple(sorted(set(diagnostics))),
+            requested_count=requested,
+            eligible_count=len(instruments),
+            expected_ineligible_count=len(set(eligibility_diagnostics)),
+            mapping_failure_count=len(set(reference_failures)),
+            indicator_not_ready_count=len(set(indicator_failures)),
+            benchmark_failure_count=len(set(benchmark_failures)),
+            raw_ticks_replayed=raw_ticks_replayed,
+            replay_elapsed_seconds=replay_elapsed_seconds,
+            diagnostics=diagnostics,
         )
 
     def _indicator_values(
@@ -192,20 +252,22 @@ class MarketScanner:
         *,
         instrument: BrokerInstrument,
         one_minute: list[Candle],
-        five_minute: list[Candle],
+        rolling_five_minute: list[Candle],
         benchmark_open: Decimal | None,
         benchmark_current: Decimal | None,
         baseline_store: RelativeVolumeBaselineReader,
         session_date: date,
     ) -> dict[str, Decimal] | tuple[str, ...]:
         reasons: list[str] = []
-        if not one_minute or not five_minute:
+        if not one_minute or not rolling_five_minute:
             return ("completed_candles_missing",)
-        closes = [candle.close_price for candle in five_minute]
+        if not _starts_at_session_open(one_minute, session_date):
+            reasons.append("session_open_not_ready")
+        closes = [candle.close_price for candle in rolling_five_minute]
         vwap_result = session_vwap(one_minute)
         ema9_result = ema(closes, 9)
         ema20_result = ema(closes, 20)
-        atr_result = atr(five_minute, 14)
+        atr_result = atr(rolling_five_minute, 14)
         opening_result = opening_range(one_minute, minutes=self._opening_range_minutes)
         latest = one_minute[-1]
         session_open = datetime.combine(session_date, time(9, 15), tzinfo=IST)
@@ -357,15 +419,28 @@ class MarketScanner:
         )
 
 
-def _interval(candles: Sequence[Candle], interval: CandleInterval) -> list[Candle]:
+def _interval(
+    candles: Sequence[Candle],
+    interval: CandleInterval,
+    *,
+    session_date: date | None = None,
+    evaluation_at: datetime | None = None,
+) -> list[Candle]:
     return sorted(
         (
             candle
             for candle in candles
             if candle.interval is interval and candle.completed and candle.trusted
+            and (session_date is None or candle.start_at.date() == session_date)
+            and (evaluation_at is None or candle.end_at <= evaluation_at)
         ),
         key=lambda candle: candle.start_at,
     )
+
+
+def _starts_at_session_open(candles: Sequence[Candle], session_date: date) -> bool:
+    expected = datetime.combine(session_date, time(9, 15), tzinfo=IST)
+    return bool(candles) and candles[0].start_at == expected
 
 
 def _required(value: Decimal | None) -> Decimal:

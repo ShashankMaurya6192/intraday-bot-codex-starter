@@ -6,6 +6,15 @@ from .candles import (
     session_close_for,
 )
 from .health import MarketDataHealthMonitor
+from .history import (
+    HistoricalBootstrapError,
+    HistoricalBootstrapResult,
+    HistoricalBootstrapService,
+    HistoricalBootstrapStatus,
+    HistoricalSymbolResult,
+    aggregate_historical_five_minute,
+    normalize_historical_response,
+)
 from .models import (
     Candle,
     CandleInterval,
@@ -14,12 +23,17 @@ from .models import (
     TickAssessment,
 )
 from .regime import MarketRegime, classify_market_regime
-from .replay import MarketReplayEngine, ReplayResult
+from .replay import MarketReplayEngine, ReplayResult, ReplaySafetyLimitExceeded
 
 __all__ = [
     "Candle",
     "CandleInterval",
     "InstrumentHealth",
+    "HistoricalBootstrapError",
+    "HistoricalBootstrapResult",
+    "HistoricalBootstrapService",
+    "HistoricalBootstrapStatus",
+    "HistoricalSymbolResult",
     "MarketDataHealthMonitor",
     "MarketDataHealthStatus",
     "MarketReplayEngine",
@@ -28,8 +42,11 @@ __all__ = [
     "NSE_SESSION_OPEN",
     "SessionCandleAggregator",
     "ReplayResult",
+    "ReplaySafetyLimitExceeded",
     "TickAssessment",
+    "aggregate_historical_five_minute",
     "candle_start",
     "classify_market_regime",
+    "normalize_historical_response",
     "session_close_for",
 ]

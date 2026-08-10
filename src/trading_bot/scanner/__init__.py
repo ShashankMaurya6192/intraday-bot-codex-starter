@@ -1,6 +1,7 @@
 from .models import (
     CandidateBias,
     ScannerCandidate,
+    ScannerDiagnostics,
     ScannerReadiness,
     ScannerResult,
     ScannerWeights,
@@ -12,6 +13,7 @@ __all__ = [
     "MarketScanner",
     "RelativeVolumeBaselineReader",
     "ScannerCandidate",
+    "ScannerDiagnostics",
     "ScannerReadiness",
     "ScannerResult",
     "ScannerWeights",
