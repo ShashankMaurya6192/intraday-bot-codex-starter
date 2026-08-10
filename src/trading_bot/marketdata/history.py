@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -11,7 +12,13 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
-from trading_bot.broker import BrokerInstrument
+from trading_bot.broker import (
+    BrokerAuthenticationError,
+    BrokerHistoricalRateLimitError,
+    BrokerHistoricalResponseError,
+    BrokerHistoricalTransportError,
+    BrokerInstrument,
+)
 from trading_bot.domain import IST, Exchange
 
 from .candles import NSE_SESSION_CLOSE, NSE_SESSION_OPEN
@@ -20,6 +27,22 @@ from .models import Candle, CandleInterval
 
 class HistoricalBootstrapError(RuntimeError):
     """A historical response cannot safely update the local dataset."""
+
+
+_MAX_CALENDAR_DAYS_PER_REQUEST = 22
+_RATE_LIMIT_MARKERS = (
+    "exceeding access rate",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "throttl",
+)
+_SAFE_FIELD_PATTERN = re.compile(
+    r"(?i)((?:authorization|x-api-key|x-client-code|x-feed-token|"
+    r"x-privatekey|jwt[_-]?token|refresh[_-]?token|feed[_-]?token)"
+    r"['\"]?\s*[:=]\s*['\"]?)(?:bearer\s+)?[^'\"\s,}]+"
+)
+_BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^'\"\s,}]+")
 
 
 class HistoricalDataBroker(Protocol):
@@ -72,6 +95,7 @@ class HistoricalSymbolResult:
     status: str
     sessions_found: int
     cache_age_seconds: float | None
+    reason_category: str | None = None
     reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -80,27 +104,73 @@ class HistoricalSymbolResult:
             "status": self.status,
             "sessions_found": self.sessions_found,
             "cache_age_seconds": self.cache_age_seconds,
+            "reason_category": self.reason_category,
             "reason": self.reason,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class HistoricalBootstrapResult:
+    status: str
     requested_symbols: int
     completed_symbols: int
     failed_symbols: int
     sessions_found: int
     cache_age_seconds: float | None
+    skipped_after_abort: int
+    rate_limited_symbol: str | None
+    reason_category: str | None
+    operator_action: str | None
     symbols: tuple[HistoricalSymbolResult, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "requested_symbols": self.requested_symbols,
-            "completed_symbols": self.completed_symbols,
-            "failed_symbols": self.failed_symbols,
+            "status": self.status,
+            "requested": self.requested_symbols,
+            "completed": self.completed_symbols,
+            "failed": self.failed_symbols,
             "sessions_found": self.sessions_found,
             "cache_age_seconds": self.cache_age_seconds,
+            "skipped_after_abort": self.skipped_after_abort,
+            "rate_limited_symbol": self.rate_limited_symbol,
+            "reason_category": self.reason_category,
+            "operator_action": self.operator_action,
             "symbols": [item.to_dict() for item in self.symbols],
+            "order_placement_available": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalDiagnosticResult:
+    status: str
+    symbol: str
+    session_date: date
+    broker_status: object | None
+    broker_message: str | None
+    error_code: str | None
+    row_count: int
+    first_timestamp: str | None
+    last_timestamp: str | None
+    reason_category: str | None = None
+    reason: str | None = None
+
+    @property
+    def successful(self) -> bool:
+        return self.status == "SUCCESS"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "symbol": self.symbol,
+            "session_date": self.session_date.isoformat(),
+            "broker_status": self.broker_status,
+            "broker_message": self.broker_message,
+            "error_code": self.error_code,
+            "row_count": self.row_count,
+            "first_timestamp": self.first_timestamp,
+            "last_timestamp": self.last_timestamp,
+            "reason_category": self.reason_category,
+            "reason": self.reason,
             "order_placement_available": False,
         }
 
@@ -165,7 +235,7 @@ class HistoricalBootstrapService:
         from_date = through_date - timedelta(days=self._lookback_days - 1)
         results: list[HistoricalSymbolResult] = []
         request_number = 0
-        for instrument in all_instruments:
+        for instrument_index, instrument in enumerate(all_instruments):
             previous = self._store.load_historical_bootstrap_status(
                 exchange=instrument.exchange,
                 symbol_token=instrument.symbol_token,
@@ -188,18 +258,19 @@ class HistoricalBootstrapService:
                     )
                 )
                 continue
-            if request_number:
-                self._sleeper(self._request_delay)
-            request_number += 1
-            parameters = {
-                "exchange": _historical_exchange(instrument.exchange),
-                "symboltoken": instrument.symbol_token,
-                "interval": "ONE_MINUTE",
-                "fromdate": f"{from_date.isoformat()} 09:15",
-                "todate": f"{through_date.isoformat()} 15:30",
-            }
             try:
-                response = self._fetch_with_retries(parameters)
+                responses: list[Mapping[str, object]] = []
+                for chunk_start, chunk_end in _historical_date_chunks(
+                    from_date, through_date
+                ):
+                    if request_number:
+                        self._sleeper(self._request_delay)
+                    request_number += 1
+                    parameters = _historical_parameters(
+                        instrument, chunk_start, chunk_end
+                    )
+                    responses.append(self._fetch_with_retries(parameters))
+                response = _combine_historical_responses(responses)
                 one_minute, session_dates = normalize_historical_response(
                     response,
                     instrument=instrument,
@@ -208,7 +279,7 @@ class HistoricalBootstrapService:
                 five_minute = aggregate_historical_five_minute(one_minute)
                 source_sha256 = hashlib.sha256(
                     json.dumps(
-                        response,
+                        responses,
                         ensure_ascii=False,
                         separators=(",", ":"),
                         sort_keys=True,
@@ -233,6 +304,36 @@ class HistoricalBootstrapService:
                         cache_age_seconds=0.0,
                     )
                 )
+            except BrokerHistoricalRateLimitError as exc:
+                results.append(
+                    HistoricalSymbolResult(
+                        symbol=instrument.trading_symbol,
+                        status="RATE_LIMITED",
+                        sessions_found=previous.sessions_found if previous else 0,
+                        cache_age_seconds=(
+                            max(0.0, (now_ist - previous.fetched_at).total_seconds())
+                            if previous
+                            else None
+                        ),
+                        reason_category="RATE_LIMITED",
+                        reason=_safe_failure_reason(exc),
+                    )
+                )
+                return _bootstrap_result(
+                    requested_symbols=len(all_instruments),
+                    results=results,
+                    status="ABORTED_RATE_LIMIT",
+                    skipped_after_abort=len(all_instruments) - instrument_index - 1,
+                    rate_limited_symbol=instrument.trading_symbol,
+                    reason_category="RATE_LIMITED",
+                    operator_action=(
+                        "Wait for the Angel Historical API rate-limit window to "
+                        "reset, then rerun the same command. Completed symbols "
+                        "will be skipped unless --force is supplied."
+                    ),
+                )
+            except BrokerAuthenticationError:
+                raise
             except Exception as exc:
                 results.append(
                     HistoricalSymbolResult(
@@ -244,23 +345,19 @@ class HistoricalBootstrapService:
                             if previous
                             else None
                         ),
-                        reason=type(exc).__name__,
+                        reason_category=_failure_category(exc),
+                        reason=_safe_failure_reason(exc),
                     )
                 )
 
-        completed = tuple(item for item in results if item.status != "FAILED")
-        ages = [
-            item.cache_age_seconds
-            for item in completed
-            if item.cache_age_seconds is not None
-        ]
-        return HistoricalBootstrapResult(
+        return _bootstrap_result(
             requested_symbols=len(all_instruments),
-            completed_symbols=len(completed),
-            failed_symbols=len(results) - len(completed),
-            sessions_found=sum(item.sessions_found for item in completed),
-            cache_age_seconds=max(ages) if ages else None,
-            symbols=tuple(sorted(results, key=lambda item: item.symbol)),
+            results=results,
+            status=(
+                "COMPLETED_WITH_FAILURES"
+                if any(item.status == "FAILED" for item in results)
+                else "COMPLETED"
+            ),
         )
 
     def _fetch_with_retries(
@@ -271,20 +368,316 @@ class HistoricalBootstrapService:
             try:
                 response = self._broker.fetch_historical_candles(parameters)
                 if response.get("status") is not True:
-                    raise HistoricalBootstrapError(
-                        "Angel rejected the historical-candle request"
+                    broker_message = _safe_response_field(response.get("message"))
+                    error_code = _safe_response_field(response.get("errorcode"))
+                    if _looks_rate_limited(broker_message, error_code):
+                        raise BrokerHistoricalRateLimitError(
+                            "Angel Historical API rate limit: "
+                            "Access denied because of exceeding access rate",
+                            broker_status=response.get("status"),
+                            broker_message=broker_message,
+                            error_code=error_code,
+                        )
+                    raise BrokerHistoricalResponseError(
+                        "Angel Historical API rejected the request",
+                        broker_status=response.get("status"),
+                        broker_message=broker_message,
+                        error_code=error_code,
                     )
                 return response
-            except Exception as exc:
+            except (
+                BrokerHistoricalRateLimitError,
+                BrokerHistoricalResponseError,
+                BrokerAuthenticationError,
+            ):
+                raise
+            except (BrokerHistoricalTransportError, OSError) as exc:
                 last_error = exc
                 if attempt < self._max_attempts:
                     delay = min(
                         self._retry_initial * (2 ** (attempt - 1)), self._retry_max
                     )
                     self._sleeper(delay)
-        raise HistoricalBootstrapError(
-            f"historical request failed after {self._max_attempts} attempts"
+            except Exception as exc:
+                raise BrokerHistoricalTransportError(
+                    "historical request failed with a non-retryable unexpected error"
+                ) from exc
+        detail = _safe_failure_reason(last_error) if last_error else "unknown"
+        raise BrokerHistoricalTransportError(
+            f"historical transport failed after {self._max_attempts} attempts: "
+            f"{detail}"
         ) from last_error
+
+
+def run_historical_diagnostic(
+    broker: HistoricalDataBroker,
+    *,
+    instrument: BrokerInstrument,
+    session_date: date,
+) -> HistoricalDiagnosticResult:
+    """Make exactly one historical request for one prior session, without retries."""
+    parameters = _historical_parameters(instrument, session_date, session_date)
+    try:
+        response = broker.fetch_historical_candles(parameters)
+    except BrokerHistoricalRateLimitError as exc:
+        return _diagnostic_error(
+            instrument,
+            session_date,
+            exc,
+            status="ABORTED_RATE_LIMIT",
+            reason_category="RATE_LIMITED",
+        )
+    except BrokerAuthenticationError as exc:
+        return _diagnostic_error(
+            instrument,
+            session_date,
+            exc,
+            status="AUTHENTICATION_FAILED",
+            reason_category="AUTHENTICATION",
+        )
+    except BrokerHistoricalResponseError as exc:
+        return _diagnostic_error(
+            instrument,
+            session_date,
+            exc,
+            status="REJECTED",
+            reason_category="BROKER_RESPONSE_ERROR",
+        )
+    except BrokerHistoricalTransportError as exc:
+        return _diagnostic_error(
+            instrument,
+            session_date,
+            exc,
+            status="FAILED",
+            reason_category="TRANSIENT_FAILURE",
+        )
+    except Exception as exc:
+        return HistoricalDiagnosticResult(
+            status="FAILED",
+            symbol=instrument.trading_symbol,
+            session_date=session_date,
+            broker_status=None,
+            broker_message=None,
+            error_code=None,
+            row_count=0,
+            first_timestamp=None,
+            last_timestamp=None,
+            reason_category="UNEXPECTED_ERROR",
+            reason=type(exc).__name__,
+        )
+
+    broker_status = _safe_broker_status(response.get("status"))
+    broker_message = _safe_response_field(response.get("message")) or None
+    error_code = _safe_response_field(response.get("errorcode")) or None
+    if broker_status is not True:
+        category = (
+            "RATE_LIMITED"
+            if _looks_rate_limited(broker_message or "", error_code or "")
+            else "BROKER_RESPONSE_ERROR"
+        )
+        return HistoricalDiagnosticResult(
+            status=(
+                "ABORTED_RATE_LIMIT" if category == "RATE_LIMITED" else "REJECTED"
+            ),
+            symbol=instrument.trading_symbol,
+            session_date=session_date,
+            broker_status=broker_status,
+            broker_message=broker_message,
+            error_code=error_code,
+            row_count=0,
+            first_timestamp=None,
+            last_timestamp=None,
+            reason_category=category,
+            reason=(
+                "Angel Historical API rate limit"
+                if category == "RATE_LIMITED"
+                else "Angel Historical API rejected the request"
+            ),
+        )
+    rows = response.get("data")
+    if not isinstance(rows, list):
+        return HistoricalDiagnosticResult(
+            status="MALFORMED_RESPONSE",
+            symbol=instrument.trading_symbol,
+            session_date=session_date,
+            broker_status=broker_status,
+            broker_message=broker_message,
+            error_code=error_code,
+            row_count=0,
+            first_timestamp=None,
+            last_timestamp=None,
+            reason_category="BROKER_RESPONSE_ERROR",
+            reason="Angel Historical API returned malformed candle data",
+        )
+    return HistoricalDiagnosticResult(
+        status="SUCCESS",
+        symbol=instrument.trading_symbol,
+        session_date=session_date,
+        broker_status=broker_status,
+        broker_message=broker_message,
+        error_code=error_code,
+        row_count=len(rows),
+        first_timestamp=_row_timestamp(rows[0]) if rows else None,
+        last_timestamp=_row_timestamp(rows[-1]) if rows else None,
+    )
+
+
+def _diagnostic_error(
+    instrument: BrokerInstrument,
+    session_date: date,
+    exc: Exception,
+    *,
+    status: str,
+    reason_category: str,
+) -> HistoricalDiagnosticResult:
+    return HistoricalDiagnosticResult(
+        status=status,
+        symbol=instrument.trading_symbol,
+        session_date=session_date,
+        broker_status=_safe_broker_status(getattr(exc, "broker_status", None)),
+        broker_message=(
+            _safe_response_field(getattr(exc, "broker_message", None)) or None
+        ),
+        error_code=_safe_response_field(getattr(exc, "error_code", None)) or None,
+        row_count=0,
+        first_timestamp=None,
+        last_timestamp=None,
+        reason_category=reason_category,
+        reason=_safe_failure_reason(exc),
+    )
+
+
+def _bootstrap_result(
+    *,
+    requested_symbols: int,
+    results: Sequence[HistoricalSymbolResult],
+    status: str,
+    skipped_after_abort: int = 0,
+    rate_limited_symbol: str | None = None,
+    reason_category: str | None = None,
+    operator_action: str | None = None,
+) -> HistoricalBootstrapResult:
+    completed = tuple(
+        item
+        for item in results
+        if item.status in {"COMPLETED", "SKIPPED_CURRENT"}
+    )
+    failed = tuple(
+        item for item in results if item.status in {"FAILED", "RATE_LIMITED"}
+    )
+    ages = [
+        item.cache_age_seconds
+        for item in completed
+        if item.cache_age_seconds is not None
+    ]
+    return HistoricalBootstrapResult(
+        status=status,
+        requested_symbols=requested_symbols,
+        completed_symbols=len(completed),
+        failed_symbols=len(failed),
+        sessions_found=sum(item.sessions_found for item in completed),
+        cache_age_seconds=max(ages) if ages else None,
+        skipped_after_abort=skipped_after_abort,
+        rate_limited_symbol=rate_limited_symbol,
+        reason_category=reason_category,
+        operator_action=operator_action,
+        symbols=tuple(results),
+    )
+
+
+def _failure_category(exc: Exception) -> str:
+    if isinstance(exc, BrokerHistoricalResponseError):
+        return "BROKER_RESPONSE_ERROR"
+    if isinstance(exc, BrokerHistoricalTransportError):
+        return "TRANSIENT_FAILURE"
+    if isinstance(exc, HistoricalBootstrapError):
+        return "VALIDATION_ERROR"
+    return "UNEXPECTED_ERROR"
+
+
+def _safe_failure_reason(exc: Exception) -> str:
+    if isinstance(
+        exc,
+        (
+            BrokerHistoricalRateLimitError,
+            BrokerHistoricalResponseError,
+            BrokerHistoricalTransportError,
+            BrokerAuthenticationError,
+            HistoricalBootstrapError,
+        ),
+    ):
+        return _safe_response_field(str(exc))
+    return type(exc).__name__
+
+
+def _safe_response_field(value: object) -> str:
+    if value is None:
+        return ""
+    message = _SAFE_FIELD_PATTERN.sub(r"\1***", str(value))
+    message = _BEARER_PATTERN.sub("Bearer ***", message)
+    message = " ".join(message.split())
+    return message[:240]
+
+
+def _safe_broker_status(value: object) -> object | None:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _safe_response_field(value)
+    return type(value).__name__
+
+
+def _looks_rate_limited(message: str, error_code: str) -> bool:
+    normalized = message.lower()
+    return any(marker in normalized for marker in _RATE_LIMIT_MARKERS) or (
+        error_code.strip().upper()
+        in {"429", "RATE_LIMITED", "TOO_MANY_REQUESTS"}
+    )
+
+
+def _historical_parameters(
+    instrument: BrokerInstrument, from_date: date, through_date: date
+) -> dict[str, object]:
+    return {
+        "exchange": _historical_exchange(instrument.exchange),
+        "symboltoken": instrument.symbol_token,
+        "interval": "ONE_MINUTE",
+        "fromdate": f"{from_date.isoformat()} 09:15",
+        "todate": f"{through_date.isoformat()} 15:30",
+    }
+
+
+def _historical_date_chunks(
+    from_date: date, through_date: date
+) -> tuple[tuple[date, date], ...]:
+    chunks: list[tuple[date, date]] = []
+    chunk_start = from_date
+    while chunk_start <= through_date:
+        chunk_end = min(
+            chunk_start + timedelta(days=_MAX_CALENDAR_DAYS_PER_REQUEST - 1),
+            through_date,
+        )
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
+    return tuple(chunks)
+
+
+def _combine_historical_responses(
+    responses: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    combined_rows: list[object] = []
+    for response in responses:
+        rows = response.get("data")
+        if not isinstance(rows, list):
+            return {"status": True, "data": rows}
+        combined_rows.extend(rows)
+    return {"status": True, "data": combined_rows}
+
+
+def _row_timestamp(row: object) -> str | None:
+    if not isinstance(row, (list, tuple)) or not row:
+        return None
+    return _safe_response_field(row[0]) or None
 
 
 def normalize_historical_response(

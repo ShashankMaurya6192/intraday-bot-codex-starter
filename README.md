@@ -3,10 +3,10 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.1 hardens validated reference-data caches, strictly causal as-of replay,
-session/rolling indicator boundaries, zero-volume NIFTY regime classification,
-explicit historical bootstrap, automatic scanner-universe recording, and
-explainable LONG/SHORT attention rankings. Scanner results are analysis only.
+Phase 2.2 adds fail-safe SmartAPI Historical API throttling, a one-request
+historical diagnostic, bounded historical batching, and restartable batch
+outcomes to the Phase 2.1 market-intelligence implementation. Scanner results
+are analysis only.
 There is no paper execution, order interface, or live order-placement code.
 
 ## Safety status
@@ -22,6 +22,8 @@ There is no paper execution, order interface, or live order-placement code.
 - Reconnects, downloads, queues, and shutdown drains are bounded.
 - Missing, stale, corrupt, ambiguous, sequence-broken, or incomplete data
   suppresses scanner readiness.
+- A Historical API rate-limit response aborts the whole bootstrap immediately;
+  it is never retried as a transient error and never advances to another symbol.
 
 ## Windows 10/11 setup (PowerShell)
 
@@ -180,6 +182,20 @@ python -m trading_bot bootstrap-history --json
 python -m trading_bot bootstrap-history --force
 ```
 
+Before a larger bootstrap, test one authoritative cached NSE equity and one
+completed session with exactly one broker request and no retries:
+
+```powershell
+python -m trading_bot test-historical --symbol SBIN --date 2026-08-07
+python -m trading_bot test-historical --symbol SBIN --date 2026-08-07 --json
+```
+
+The diagnostic authenticates normally, resolves `SBIN-EQ` only from the fresh
+local Angel instrument cache, and prints broker status, message, error code, row
+count, and first/last timestamp. It never prints the symbol token, credentials,
+session tokens, or request headers. Throttled and rejected requests exit with
+status code 2.
+
 For the initial smoke test, set 5-20 symbols by name—never token ID—in `.env`:
 
 ```dotenv
@@ -188,13 +204,32 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 
 `bootstrap-history` authenticates the official SmartAPI Python SDK, calls its
 authenticated `POST /rest/secure/angelbroking/historical/v1/getCandleData`
-Historical API with `ONE_MINUTE`, conservatively throttles and retries, validates
-every row, requires complete 09:15-15:30 sessions, derives five-minute candles
-locally, and atomically stores normalized history in SQLite. The default 30
-calendar-day request targets at least 15 complete prior sessions. Complete
-equity sessions create RVOL baselines; NIFTY never does. A rerun skips current
-per-symbol datasets, while `--force` intentionally refreshes them. A malformed
-or partial response cannot replace the previous valid symbol dataset.
+Historical API with `ONE_MINUTE`, spaces requests conservatively, retries only
+transient transport/server failures with bounded backoff, validates every row,
+requires complete 09:15-15:30 sessions, derives five-minute candles locally,
+and atomically stores normalized history in SQLite. Rejected or malformed
+responses are not retried. The default 30-calendar-day range is split at
+deterministic session boundaries into requests of at most 22 calendar days, so
+the possible one-minute record count remains below the broker limit; all chunks
+are combined and validated before a symbol is replaced.
+
+On the first Historical API throttle response, including SmartAPI SDK
+non-JSON errors such as `Access denied because of exceeding access rate`, the
+batch returns `status=ABORTED_RATE_LIMIT` and stops immediately. It does not
+retry that request or call later symbols, even with `--force`. Human and JSON
+output report `requested`, `completed`, `failed`, `skipped_after_abort`,
+`rate_limited_symbol`, `reason_category=RATE_LIMITED`, and
+`order_placement_available=false`, plus a short operator action. Do not loop the
+command: wait for Angel's Historical API access window to reset, then rerun it.
+Previously completed atomic writes remain valid, the throttled symbol retains
+any older valid dataset, and a normal rerun skips completed symbols before
+resuming.
+
+The default range targets at least 15 complete prior sessions. Complete equity
+sessions create RVOL baselines; NIFTY never does. A rerun skips current
+per-symbol datasets, while `--force` intentionally refreshes them. A malformed,
+partial, rejected, or throttled response cannot replace the previous valid
+symbol dataset.
 
 The default universe is the intersection of:
 
@@ -217,7 +252,9 @@ with a diagnostic rather than assigned a guessed token.
 explicit refresh commands
   -> validated atomic Angel/NIFTY caches
 
-explicit SmartAPI historical bootstrap
+explicit SmartAPI historical diagnostic/bootstrap
+  -> distinct throttle/rejection/transport failure categories
+  -> immediate global abort on broker throttling
   -> validated complete 1m sessions
   -> local 5m warm-up candles + equity-only RVOL baselines
 
@@ -341,7 +378,7 @@ credential-free pytest suite.
 Each as-of scan first counts raw ticks without loading them, rejects a count over
 `SCAN_REPLAY_HARD_TICK_LIMIT`, and reports raw ticks replayed plus replay elapsed
 time. Configurable tick/runtime warnings make current replay cost visible. This
-bounded replay remains a Phase 2.1 bridge: an incremental live intelligence
+bounded replay remains a Phase 2.2 bridge: an incremental live intelligence
 worker with persisted health/candle snapshots is the next scaling step before
 any live automation.
 

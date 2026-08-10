@@ -22,6 +22,7 @@ from .marketdata import (
     HistoricalBootstrapService,
     MarketReplayEngine,
     ReplaySafetyLimitExceeded,
+    run_historical_diagnostic,
 )
 from .reference_data import (
     NIFTY500_CONSTITUENTS_URL,
@@ -82,6 +83,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     history.add_argument("--force", action="store_true")
     history.add_argument("--json", action="store_true", dest="json_output")
+    diagnostic = subparsers.add_parser(
+        "test-historical",
+        help="make exactly one SmartAPI historical request for one prior session",
+    )
+    diagnostic.add_argument("--symbol", required=True)
+    diagnostic.add_argument("--date", required=True, type=_iso_date)
+    diagnostic.add_argument("--json", action="store_true", dest="json_output")
     scan = subparsers.add_parser(
         "scan", help="rank analysis-only LONG/SHORT attention candidates"
     )
@@ -101,7 +109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.1")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.2")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -163,6 +171,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _bootstrap_history(
             settings,
             force=args.force,
+            json_output=args.json_output,
+        )
+
+    if command == "test-historical":
+        return _test_historical(
+            settings,
+            symbol=args.symbol,
+            session_date=args.date,
             json_output=args.json_output,
         )
 
@@ -317,17 +333,69 @@ def _bootstrap_history(
     else:
         print(
             "Historical bootstrap: "
+            f"status={result.status} "
             f"requested={result.requested_symbols} "
             f"completed={result.completed_symbols} failed={result.failed_symbols} "
+            f"skipped_after_abort={result.skipped_after_abort} "
+            f"rate_limited_symbol={result.rate_limited_symbol} "
+            f"reason_category={result.reason_category} "
             f"sessions={result.sessions_found} "
-            f"cache_age_seconds={result.cache_age_seconds}"
+            f"cache_age_seconds={result.cache_age_seconds} "
+            "order_placement_available=False"
         )
         for item in result.symbols:
             print(
                 f"  {item.symbol}: {item.status} sessions={item.sessions_found} "
-                f"cache_age_seconds={item.cache_age_seconds} reason={item.reason}"
+                f"cache_age_seconds={item.cache_age_seconds} "
+                f"reason_category={item.reason_category} reason={item.reason}"
             )
+        if result.operator_action is not None:
+            print(f"Operator action: {result.operator_action}")
     return 0 if result.failed_symbols == 0 else 2
+
+
+def _test_historical(
+    settings: Settings,
+    *,
+    symbol: str,
+    session_date: date,
+    json_output: bool,
+) -> int:
+    now = datetime.now(IST)
+    if session_date >= now.date():
+        raise ValueError("--date must identify a completed prior session")
+    instrument_cache = _instrument_cache(settings).load(now=now)
+    trading_symbol = symbol.strip().upper()
+    if not trading_symbol.endswith("-EQ"):
+        trading_symbol = f"{trading_symbol}-EQ"
+    instrument = instrument_cache.find_trading_symbol(
+        Exchange.NSE_CM, trading_symbol
+    )
+    if instrument is None or not instrument.is_normal_nse_equity:
+        raise RuntimeError(
+            "diagnostic symbol is unavailable as an authoritative normal NSE equity"
+        )
+    _require_credentials(settings)
+    result = run_historical_diagnostic(
+        AngelOneMarketDataAdapter(_credentials(settings)),
+        instrument=instrument,
+        session_date=session_date,
+    )
+    payload = result.to_dict()
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Historical diagnostic: status={result.status} "
+            f"symbol={result.symbol} date={result.session_date.isoformat()} "
+            f"broker_status={result.broker_status} "
+            f"message={result.broker_message} errorcode={result.error_code} "
+            f"rows={result.row_count} first={result.first_timestamp} "
+            f"last={result.last_timestamp} "
+            f"reason_category={result.reason_category} reason={result.reason} "
+            "order_placement_available=False"
+        )
+    return 0 if result.successful else 2
 
 
 def _data_status(settings: Settings, *, json_output: bool) -> int:

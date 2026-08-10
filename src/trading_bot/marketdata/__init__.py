@@ -11,9 +11,11 @@ from .history import (
     HistoricalBootstrapResult,
     HistoricalBootstrapService,
     HistoricalBootstrapStatus,
+    HistoricalDiagnosticResult,
     HistoricalSymbolResult,
     aggregate_historical_five_minute,
     normalize_historical_response,
+    run_historical_diagnostic,
 )
 from .models import (
     Candle,
@@ -33,6 +35,7 @@ __all__ = [
     "HistoricalBootstrapResult",
     "HistoricalBootstrapService",
     "HistoricalBootstrapStatus",
+    "HistoricalDiagnosticResult",
     "HistoricalSymbolResult",
     "MarketDataHealthMonitor",
     "MarketDataHealthStatus",
@@ -48,5 +51,6 @@ __all__ = [
     "candle_start",
     "classify_market_regime",
     "normalize_historical_response",
+    "run_historical_diagnostic",
     "session_close_for",
 ]

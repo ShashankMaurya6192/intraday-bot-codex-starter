@@ -29,6 +29,35 @@ class BrokerReferenceDataError(BrokerError):
     """A broker reference-data request failed or returned an invalid envelope."""
 
 
+class BrokerHistoricalDataError(BrokerReferenceDataError):
+    """Base error for a sanitized historical-candle request failure."""
+
+    def __init__(
+        self,
+        safe_message: str,
+        *,
+        broker_status: object | None = None,
+        broker_message: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(safe_message)
+        self.broker_status = broker_status
+        self.broker_message = broker_message
+        self.error_code = error_code
+
+
+class BrokerHistoricalRateLimitError(BrokerHistoricalDataError):
+    """Angel rejected historical data because the access rate was exceeded."""
+
+
+class BrokerHistoricalResponseError(BrokerHistoricalDataError):
+    """Historical data returned a rejected or malformed broker response."""
+
+
+class BrokerHistoricalTransportError(BrokerHistoricalDataError):
+    """A retryable transport/server failure interrupted historical data."""
+
+
 class TickNormalizationError(BrokerError):
     """A broker payload could not be converted into a valid domain tick."""
 

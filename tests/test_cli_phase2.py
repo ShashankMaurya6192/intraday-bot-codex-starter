@@ -9,6 +9,7 @@ def test_phase2_cli_exposes_only_data_and_analysis_commands() -> None:
         "refresh-nifty500",
         "record-scanner-market",
         "bootstrap-history",
+        "test-historical",
         "data-status",
         "replay",
         "scan",
@@ -18,6 +19,8 @@ def test_phase2_cli_exposes_only_data_and_analysis_commands() -> None:
         arguments = [command]
         if command == "replay":
             arguments.extend(["--date", "2026-08-10"])
+        if command == "test-historical":
+            arguments.extend(["--symbol", "SBIN", "--date", "2026-08-07"])
         parsed = parser.parse_args(arguments)
         assert parsed.command == command
 

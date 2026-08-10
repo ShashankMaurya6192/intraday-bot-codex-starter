@@ -29,6 +29,10 @@ from trading_bot.domain import (
 
 from .interfaces import (
     BrokerAuthenticationError,
+    BrokerError,
+    BrokerHistoricalRateLimitError,
+    BrokerHistoricalResponseError,
+    BrokerHistoricalTransportError,
     BrokerReferenceDataError,
     BrokerSession,
     FeedEventHandler,
@@ -66,6 +70,28 @@ _SENSITIVE_HEADER_PATTERN = re.compile(
     r"(?i)((?:authorization|x-api-key|x-client-code|x-feed-token|"
     r"x-privatekey)['\"]?\s*[:=]\s*['\"]?)(?:bearer\s+)?[^'\"\s,}]+"
 )
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bbearer\s+[^'\"\s,}]+")
+_RATE_LIMIT_MARKERS = (
+    "exceeding access rate",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "throttl",
+)
+_AUTHENTICATION_MARKERS = (
+    "invalid token",
+    "token expired",
+    "session expired",
+    "authentication failed",
+    "unauthorized",
+)
+_NON_JSON_MARKERS = (
+    "couldn't parse the json",
+    "could not parse the json",
+    "jsondecode",
+    "non-json",
+)
+_MAX_SAFE_BROKER_MESSAGE_LENGTH = 240
 
 
 class _RestClient(Protocol):
@@ -359,14 +385,124 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
             # SmartAPI mutates its parameter dictionary while removing None values.
             response = client.getCandleData(dict(parameters))
         except Exception as exc:
-            raise BrokerReferenceDataError(
-                "Angel historical-candle request failed"
-            ) from exc
+            raise self._classify_historical_exception(exc) from exc
         if not isinstance(response, Mapping):
-            raise BrokerReferenceDataError(
-                "Angel historical-candle response is malformed"
+            raise BrokerHistoricalResponseError(
+                "Angel Historical API returned a malformed response"
+            )
+        response = dict(response)
+        if "message" in response:
+            response["message"] = self._safe_historical_text(response["message"])
+        if "errorcode" in response:
+            response["errorcode"] = self._safe_historical_text(
+                response["errorcode"]
+            )
+        if response.get("status") is not True:
+            broker_status = response.get("status")
+            broker_message = self._safe_historical_text(response.get("message"))
+            error_code = self._safe_historical_text(response.get("errorcode"))
+            if _is_rate_limited(broker_message, error_code=error_code):
+                raise BrokerHistoricalRateLimitError(
+                    "Angel Historical API rate limit: "
+                    "Access denied because of exceeding access rate",
+                    broker_status=broker_status,
+                    broker_message=broker_message,
+                    error_code=error_code,
+                )
+            raise BrokerHistoricalResponseError(
+                _broker_rejection_message(broker_message, error_code),
+                broker_status=broker_status,
+                broker_message=broker_message,
+                error_code=error_code,
             )
         return response
+
+    def _classify_historical_exception(
+        self, exc: Exception
+    ) -> BrokerError:
+        safe_message = self._safe_historical_text(exc)
+        response = getattr(exc, "response", None)
+        broker_status = getattr(exc, "status_code", None) or getattr(
+            response, "status_code", None
+        )
+        safe_body = self._safe_historical_text(
+            getattr(response, "text", None) or getattr(response, "content", None)
+        )
+        classification_message = " ".join(
+            item for item in (safe_message, safe_body) if item
+        )
+        error_code = self._safe_historical_text(
+            getattr(exc, "errorcode", None) or getattr(exc, "code", None)
+        )
+        exception_name = type(exc).__name__.lower()
+        if _is_rate_limited(
+            classification_message,
+            error_code=error_code or str(broker_status or ""),
+        ):
+            return BrokerHistoricalRateLimitError(
+                "Angel Historical API rate limit: "
+                "Access denied because of exceeding access rate",
+                broker_status=broker_status,
+                broker_message=classification_message,
+                error_code=error_code,
+            )
+        if (
+            "tokenexception" in exception_name
+            or "permissionexception" in exception_name
+            or str(broker_status or error_code) in {"401", "403"}
+            or any(
+                marker in classification_message.lower()
+                for marker in _AUTHENTICATION_MARKERS
+            )
+        ):
+            return BrokerAuthenticationError(
+                "Angel Historical API authentication/token was rejected"
+            )
+        if any(
+            marker in classification_message.lower() for marker in _NON_JSON_MARKERS
+        ):
+            return BrokerHistoricalResponseError(
+                "Angel Historical API returned malformed non-JSON content: "
+                f"{classification_message}",
+                broker_status=broker_status,
+                broker_message=classification_message,
+                error_code=error_code,
+            )
+        if any(
+            marker in exception_name
+            for marker in ("dataexception", "inputexception", "validationexception")
+        ):
+            return BrokerHistoricalResponseError(
+                "Angel Historical API returned an invalid response: "
+                f"{classification_message}",
+                broker_status=broker_status,
+                broker_message=classification_message,
+                error_code=error_code,
+            )
+        detail = f": {classification_message}" if classification_message else ""
+        return BrokerHistoricalTransportError(
+            f"Angel Historical API transport/server failure{detail}",
+            broker_status=broker_status,
+            broker_message=classification_message or None,
+            error_code=error_code,
+        )
+
+    def _safe_historical_text(self, value: object) -> str:
+        secrets = [
+            self._credentials.api_key,
+            self._credentials.client_code,
+            self._credentials.password,
+            self._credentials.totp_secret,
+        ]
+        if self._session is not None:
+            secrets.extend(
+                (
+                    self._session.access_token,
+                    self._session.refresh_token,
+                    self._session.feed_token,
+                )
+            )
+        return _sanitize_broker_text(value, secrets)
 
     def stream(
         self,
@@ -705,6 +841,43 @@ def _nonblank_string(value: object) -> str | None:
         return None
     value = value.strip()
     return value or None
+
+
+def _sanitize_broker_text(value: object, secrets: Sequence[str] = ()) -> str:
+    if value is None:
+        return ""
+    message = str(value)
+    for secret in sorted({item for item in secrets if item}, key=len, reverse=True):
+        message = message.replace(secret, "***")
+    message = _SENSITIVE_HEADER_PATTERN.sub(r"\1***", message)
+    message = _BEARER_TOKEN_PATTERN.sub("Bearer ***", message)
+    message = " ".join(message.split())
+    if len(message) > _MAX_SAFE_BROKER_MESSAGE_LENGTH:
+        message = f"{message[:_MAX_SAFE_BROKER_MESSAGE_LENGTH - 3]}..."
+    return message
+
+
+def _is_rate_limited(message: str, *, error_code: str | None = None) -> bool:
+    normalized = message.lower()
+    if any(marker in normalized for marker in _RATE_LIMIT_MARKERS):
+        return True
+    return (error_code or "").strip().upper() in {
+        "429",
+        "RATE_LIMITED",
+        "TOO_MANY_REQUESTS",
+    }
+
+
+def _broker_rejection_message(
+    broker_message: str, error_code: str | None
+) -> str:
+    details = []
+    if broker_message:
+        details.append(f"message={broker_message}")
+    if error_code:
+        details.append(f"errorcode={error_code}")
+    suffix = f": {' '.join(details)}" if details else ""
+    return f"Angel Historical API rejected the request{suffix}"
 
 
 def _required_string(payload: Mapping[str, Any], key: str) -> str:
