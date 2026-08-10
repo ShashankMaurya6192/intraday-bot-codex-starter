@@ -1,6 +1,6 @@
 """Broker boundaries for authentication and market data only.
 
-Order placement intentionally does not exist in the Phase 1.5 interfaces.
+Order placement intentionally does not exist in the Phase 2 interfaces.
 """
 
 from __future__ import annotations
@@ -23,6 +23,10 @@ class BrokerAuthenticationError(BrokerError):
 
 class MarketDataConnectionError(BrokerError):
     """The market-data feed could not reach a trustworthy connected state."""
+
+
+class BrokerReferenceDataError(BrokerError):
+    """A broker reference-data request failed or returned an invalid envelope."""
 
 
 class TickNormalizationError(BrokerError):

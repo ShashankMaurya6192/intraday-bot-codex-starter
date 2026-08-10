@@ -16,6 +16,11 @@ def test_default_is_paper() -> None:
     assert settings.websocket_stable_connection_seconds == 30
     assert settings.tick_ingestion_queue_capacity == 10_000
     assert settings.tick_ingestion_batch_size == 250
+    assert settings.instrument_master_max_age_days == 7
+    assert settings.intraday_universe_max_age_seconds == 28_800
+    assert settings.relative_volume_lookback_sessions == 15
+    assert settings.relative_volume_minimum_sessions == 10
+    assert settings.configured_scanner_symbols() == ()
 
 
 def test_live_requires_both_feature_gate_and_startup_confirmation() -> None:
@@ -95,3 +100,19 @@ def test_ingestion_batch_cannot_exceed_queue_capacity() -> None:
             tick_ingestion_queue_capacity=10,
             tick_ingestion_batch_size=11,
         )
+
+
+def test_scanner_symbol_override_and_rvol_warmup_are_validated() -> None:
+    settings = Settings(_env_file=None, scanner_symbols="SBIN, RELIANCE")
+    assert settings.configured_scanner_symbols() == ("SBIN", "RELIANCE")
+
+    with pytest.raises(ValidationError, match="minimum sessions"):
+        Settings(
+            _env_file=None,
+            relative_volume_lookback_sessions=5,
+            relative_volume_minimum_sessions=6,
+        )
+
+    duplicate = Settings(_env_file=None, scanner_symbols="SBIN,SBIN")
+    with pytest.raises(ValueError, match="duplicates"):
+        duplicate.configured_scanner_symbols()

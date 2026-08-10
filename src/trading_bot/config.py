@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -47,6 +48,36 @@ class Settings(BaseSettings):
     tick_ingestion_flush_interval_seconds: float = Field(default=0.05, gt=0, le=5)
     tick_ingestion_shutdown_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
 
+    instrument_master_cache_path: Path = Path("data/cache/angel_instruments.json")
+    instrument_master_max_age_days: int = Field(default=7, ge=1, le=90)
+    intraday_universe_cache_path: Path = Path("data/cache/angel_nse_intraday.json")
+    intraday_universe_max_age_seconds: float = Field(default=28_800, gt=0, le=86_400)
+    nifty500_cache_path: Path = Path("data/cache/nifty500.json")
+    nifty500_max_age_days: int = Field(default=7, ge=1, le=90)
+    reference_download_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    reference_download_read_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    reference_download_max_attempts: int = Field(default=3, ge=1, le=5)
+
+    scanner_symbols: str = ""
+    nifty_benchmark_trading_symbol: str = "NIFTY 50"
+    market_data_recovery_consecutive_ticks: int = Field(default=3, ge=1, le=100)
+    market_data_allowed_sequence_gap: int = Field(default=0, ge=0, le=100)
+    relative_volume_lookback_sessions: int = Field(default=15, ge=1, le=100)
+    relative_volume_minimum_sessions: int = Field(default=10, ge=1, le=100)
+    relative_volume_threshold: Decimal = Field(default=Decimal("1.5"), gt=0)
+    opening_range_minutes: int = Field(default=15, ge=1, le=60)
+    scanner_breakout_proximity_pct: Decimal = Field(
+        default=Decimal("0.25"), ge=0, le=10
+    )
+    regime_momentum_threshold_pct: Decimal = Field(default=Decimal("0.05"), ge=0, le=10)
+    regime_slope_lookback_candles: int = Field(default=3, ge=1, le=20)
+    scanner_weight_vwap: Decimal = Field(default=Decimal("2"), ge=0)
+    scanner_weight_ema: Decimal = Field(default=Decimal("2"), ge=0)
+    scanner_weight_relative_volume: Decimal = Field(default=Decimal("2"), ge=0)
+    scanner_weight_relative_strength: Decimal = Field(default=Decimal("2"), ge=0)
+    scanner_weight_opening_range: Decimal = Field(default=Decimal("1"), ge=0)
+    scanner_weight_market_regime: Decimal = Field(default=Decimal("1"), ge=0)
+
     risk_per_trade_pct: Decimal = Field(default=Decimal("0.003"), gt=0, le=1)
     max_daily_loss_pct: Decimal = Field(default=Decimal("0.009"), gt=0, le=1)
     max_open_positions: int = Field(default=2, ge=1)
@@ -59,7 +90,7 @@ class Settings(BaseSettings):
     def validate_database_url(cls, value: str) -> str:
         value = value.strip()
         if not value.startswith("sqlite:///"):
-            raise ValueError("only sqlite:/// database URLs are supported in Phase 1")
+            raise ValueError("only sqlite:/// database URLs are supported in Phase 2")
         if not value.removeprefix("sqlite:///"):
             raise ValueError("database_url must include a SQLite path")
         return value
@@ -85,6 +116,14 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("nifty_benchmark_trading_symbol")
+    @classmethod
+    def validate_benchmark_symbol(cls, value: str) -> str:
+        value = value.strip().upper()
+        if not value:
+            raise ValueError("nifty benchmark trading symbol must not be blank")
+        return value
+
     @model_validator(mode="after")
     def validate_risk_relationships(self) -> Settings:
         if self.risk_per_trade_pct > self.max_daily_loss_pct:
@@ -104,6 +143,13 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "tick ingestion flush interval cannot exceed shutdown timeout"
+            )
+        if (
+            self.relative_volume_minimum_sessions
+            > self.relative_volume_lookback_sessions
+        ):
+            raise ValueError(
+                "relative volume minimum sessions cannot exceed lookback sessions"
             )
         return self
 
@@ -159,10 +205,22 @@ class Settings(BaseSettings):
             )
         return tuple(subscriptions)
 
+    def configured_scanner_symbols(self) -> tuple[str, ...]:
+        if not self.scanner_symbols.strip():
+            return ()
+        symbols = tuple(
+            symbol.strip().upper()
+            for symbol in self.scanner_symbols.split(",")
+            if symbol.strip()
+        )
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("SCANNER_SYMBOLS must not contain duplicates")
+        return symbols
+
     def assert_live_allowed(
         self, *, explicit_startup_confirmation: bool = False
     ) -> None:
-        """Fail closed unless both live gates are explicitly satisfied."""
+        """Fail closed unless both future live gates are explicitly satisfied."""
         if self.trading_mode is TradingMode.PAPER:
             return
         if not self.live_trading_enabled:

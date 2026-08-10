@@ -6,7 +6,7 @@ import json
 import sqlite3
 import threading
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import unquote
@@ -19,6 +19,7 @@ from trading_bot.domain import (
     MarketTick,
     SubscriptionMode,
 )
+from trading_bot.marketdata import Candle, CandleInterval
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -64,11 +65,47 @@ CREATE TABLE IF NOT EXISTS market_feed_events (
 
 CREATE INDEX IF NOT EXISTS idx_market_feed_events_time
     ON market_feed_events (occurred_at);
+
+CREATE TABLE IF NOT EXISTS market_candles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exchange TEXT NOT NULL,
+    symbol_token TEXT NOT NULL,
+    trading_symbol TEXT,
+    interval_minutes INTEGER NOT NULL CHECK (interval_minutes IN (1, 5)),
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    open_price TEXT NOT NULL,
+    high_price TEXT NOT NULL,
+    low_price TEXT NOT NULL,
+    close_price TEXT NOT NULL,
+    volume INTEGER NOT NULL CHECK (volume >= 0),
+    tick_count INTEGER NOT NULL CHECK (tick_count > 0),
+    completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
+    trusted INTEGER NOT NULL CHECK (trusted IN (0, 1)),
+    UNIQUE (exchange, symbol_token, interval_minutes, start_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_candles_instrument_time
+    ON market_candles (exchange, symbol_token, interval_minutes, start_at);
+
+CREATE TABLE IF NOT EXISTS relative_volume_baselines (
+    exchange TEXT NOT NULL,
+    symbol_token TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    minute_offset INTEGER NOT NULL CHECK (minute_offset BETWEEN 0 AND 374),
+    cumulative_volume INTEGER NOT NULL CHECK (cumulative_volume >= 0),
+    PRIMARY KEY (exchange, symbol_token, session_date, minute_offset)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rvol_baseline_lookup
+    ON relative_volume_baselines (
+        exchange, symbol_token, minute_offset, session_date DESC
+    );
 """
 
 
 class SQLiteMarketRecorder:
-    """Persist market data synchronously before downstream processing."""
+    """Persist ticks, completed candles, feed events, and RVOL baselines."""
 
     def __init__(self, database_url: str, *, busy_timeout_ms: int = 5_000) -> None:
         if busy_timeout_ms < 100:
@@ -98,6 +135,13 @@ class SQLiteMarketRecorder:
                 VALUES (?, ?)
                 """,
                 (1, datetime.now(IST).isoformat()),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_version(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (2, datetime.now(IST).isoformat()),
             )
             self._connection.commit()
 
@@ -144,6 +188,9 @@ class SQLiteMarketRecorder:
         *,
         exchange: Exchange | None = None,
         symbol_token: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        received_order: bool = False,
         limit: int | None = None,
     ) -> list[MarketTick]:
         if limit is not None and limit < 1:
@@ -156,11 +203,20 @@ class SQLiteMarketRecorder:
         if symbol_token is not None:
             clauses.append("symbol_token = ?")
             parameters.append(symbol_token)
+        if start_at is not None:
+            clauses.append("exchange_timestamp >= ?")
+            parameters.append(_aware_iso(start_at))
+        if end_at is not None:
+            clauses.append("exchange_timestamp < ?")
+            parameters.append(_aware_iso(end_at))
 
         sql = "SELECT * FROM market_ticks"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY exchange_timestamp, sequence_number"
+        if received_order:
+            sql += " ORDER BY received_at, id"
+        else:
+            sql += " ORDER BY exchange_timestamp, sequence_number"
         if limit is not None:
             sql += " LIMIT ?"
             parameters.append(limit)
@@ -168,6 +224,138 @@ class SQLiteMarketRecorder:
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
         return [_row_to_tick(row) for row in rows]
+
+    def record_candles(self, candles: Iterable[Candle]) -> int:
+        """Persist completed candles idempotently in one transaction."""
+        values = [_candle_values(candle) for candle in candles]
+        if not values:
+            return 0
+        inserted = 0
+        with self._lock, self._connection:
+            for value in values:
+                cursor = self._connection.execute(_INSERT_CANDLE, value)
+                inserted += int(cursor.rowcount == 1)
+        return inserted
+
+    def load_candles(
+        self,
+        *,
+        exchange: Exchange | None = None,
+        symbol_token: str | None = None,
+        interval: CandleInterval | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> list[Candle]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if exchange is not None:
+            clauses.append("exchange = ?")
+            parameters.append(exchange.value)
+        if symbol_token is not None:
+            clauses.append("symbol_token = ?")
+            parameters.append(symbol_token)
+        if interval is not None:
+            clauses.append("interval_minutes = ?")
+            parameters.append(int(interval))
+        if start_at is not None:
+            clauses.append("start_at >= ?")
+            parameters.append(_aware_iso(start_at))
+        if end_at is not None:
+            clauses.append("start_at < ?")
+            parameters.append(_aware_iso(end_at))
+        sql = "SELECT * FROM market_candles"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY start_at, interval_minutes, exchange, symbol_token"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        return [_row_to_candle(row) for row in rows]
+
+    def record_volume_baseline_session(
+        self,
+        *,
+        exchange: Exchange,
+        symbol_token: str,
+        session_date: date,
+        cumulative_by_minute: dict[int, int],
+        complete: bool,
+        trusted: bool,
+    ) -> bool:
+        """Store only complete/trusted sessions for like-for-like RVOL."""
+        token = symbol_token.strip()
+        if not token:
+            raise ValueError("symbol_token must not be blank")
+        previous = -1
+        for minute, cumulative in sorted(cumulative_by_minute.items()):
+            if not 0 <= minute <= 374:
+                raise ValueError("baseline minute must be within the NSE session")
+            if cumulative < previous:
+                raise ValueError("baseline cumulative volume must be non-decreasing")
+            previous = cumulative
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                DELETE FROM relative_volume_baselines
+                WHERE exchange = ? AND symbol_token = ? AND session_date = ?
+                """,
+                (exchange.value, token, session_date.isoformat()),
+            )
+            if not complete or not trusted or not cumulative_by_minute:
+                return False
+            self._connection.executemany(
+                """
+                INSERT INTO relative_volume_baselines(
+                    exchange, symbol_token, session_date,
+                    minute_offset, cumulative_volume
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        exchange.value,
+                        token,
+                        session_date.isoformat(),
+                        minute,
+                        cumulative,
+                    )
+                    for minute, cumulative in sorted(cumulative_by_minute.items())
+                ],
+            )
+        return True
+
+    def load_rvol_baselines(
+        self,
+        *,
+        exchange: Exchange,
+        symbol_token: str,
+        before_date: date,
+        minute_offset: int,
+        lookback_sessions: int,
+    ) -> tuple[int, ...]:
+        if not 0 <= minute_offset <= 374:
+            raise ValueError("minute_offset must be within the NSE session")
+        if lookback_sessions < 1:
+            raise ValueError("lookback_sessions must be positive")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT cumulative_volume
+                FROM relative_volume_baselines
+                WHERE exchange = ?
+                  AND symbol_token = ?
+                  AND session_date < ?
+                  AND minute_offset = ?
+                ORDER BY session_date DESC
+                LIMIT ?
+                """,
+                (
+                    exchange.value,
+                    symbol_token,
+                    before_date.isoformat(),
+                    minute_offset,
+                    lookback_sessions,
+                ),
+            ).fetchall()
+        return tuple(int(row["cumulative_volume"]) for row in rows)
 
     def load_feed_events(self, *, limit: int | None = None) -> list[FeedEvent]:
         if limit is not None and limit < 1:
@@ -244,6 +432,14 @@ INSERT OR IGNORE INTO market_ticks(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
+_INSERT_CANDLE = """
+INSERT OR IGNORE INTO market_candles(
+    exchange, symbol_token, trading_symbol, interval_minutes,
+    start_at, end_at, open_price, high_price, low_price, close_price,
+    volume, tick_count, completed, trusted
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
 
 def _tick_values(tick: MarketTick) -> tuple[object, ...]:
     return (
@@ -291,6 +487,46 @@ def _row_to_tick(row: sqlite3.Row) -> MarketTick:
     )
 
 
+def _candle_values(candle: Candle) -> tuple[object, ...]:
+    if not candle.completed:
+        raise ValueError("only completed candles may be persisted")
+    return (
+        candle.exchange.value,
+        candle.symbol_token,
+        candle.trading_symbol,
+        int(candle.interval),
+        candle.start_at.isoformat(),
+        candle.end_at.isoformat(),
+        str(candle.open_price),
+        str(candle.high_price),
+        str(candle.low_price),
+        str(candle.close_price),
+        candle.volume,
+        candle.tick_count,
+        int(candle.completed),
+        int(candle.trusted),
+    )
+
+
+def _row_to_candle(row: sqlite3.Row) -> Candle:
+    return Candle(
+        exchange=Exchange(row["exchange"]),
+        symbol_token=row["symbol_token"],
+        trading_symbol=row["trading_symbol"],
+        interval=CandleInterval(row["interval_minutes"]),
+        start_at=datetime.fromisoformat(row["start_at"]),
+        end_at=datetime.fromisoformat(row["end_at"]),
+        open_price=Decimal(row["open_price"]),
+        high_price=Decimal(row["high_price"]),
+        low_price=Decimal(row["low_price"]),
+        close_price=Decimal(row["close_price"]),
+        volume=row["volume"],
+        tick_count=row["tick_count"],
+        completed=bool(row["completed"]),
+        trusted=bool(row["trusted"]),
+    )
+
+
 def _optional_decimal_string(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
@@ -307,3 +543,9 @@ def _json(value: object) -> str:
         sort_keys=True,
         default=str,
     )
+
+
+def _aware_iso(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp filters must be timezone-aware")
+    return value.astimezone(IST).isoformat()

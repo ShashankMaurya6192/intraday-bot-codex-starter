@@ -29,6 +29,7 @@ from trading_bot.domain import (
 
 from .interfaces import (
     BrokerAuthenticationError,
+    BrokerReferenceDataError,
     BrokerSession,
     FeedEventHandler,
     MarketDataBroker,
@@ -73,6 +74,8 @@ class _RestClient(Protocol):
     ) -> Mapping[str, Any]: ...
 
     def getfeedToken(self) -> str: ...
+
+    def nseIntraday(self) -> Mapping[str, Any]: ...
 
 
 class _WebSocketClient(Protocol):
@@ -238,7 +241,7 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         if subscription_mode is SubscriptionMode.DEPTH:
             # SmartAPI depth has tighter exchange/token limits. It is deliberately
             # excluded from the initial equity recorder until separately tested.
-            raise ValueError("DEPTH mode is not supported by the Phase 1.5 adapter")
+            raise ValueError("DEPTH mode is not supported by the Phase 2 adapter")
 
         self._credentials = credentials
         self._subscription_mode = subscription_mode
@@ -319,6 +322,25 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         self._rest_client = client
         self._session = session
         return session
+
+    def fetch_nse_intraday(self) -> Mapping[str, Any]:
+        """Fetch Angel's authenticated analysis-only NSE intraday universe."""
+        if self._session is None or self._rest_client is None:
+            self.authenticate()
+        client = self._rest_client
+        if client is None:
+            raise BrokerReferenceDataError("Angel REST session is unavailable")
+        try:
+            response = client.nseIntraday()
+        except Exception as exc:
+            raise BrokerReferenceDataError(
+                "Angel NSE intraday-universe request failed"
+            ) from exc
+        if not isinstance(response, Mapping):
+            raise BrokerReferenceDataError(
+                "Angel NSE intraday-universe response is malformed"
+            )
+        return response
 
     def stream(
         self,

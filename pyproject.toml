@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "intraday-bot"
-version = "0.1.0"
-description = "Paper-first Angel One intraday trading bot"
+version = "0.2.0"
+description = "Paper-first Angel One market-data intelligence scanner"
 requires-python = ">=3.11"
 dependencies = [
   "pydantic>=2.7",

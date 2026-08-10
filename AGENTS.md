@@ -142,13 +142,31 @@ Suggested modules:
 - The project transport must preserve the SDK parser/protocol behavior while
   overriding its unverified TLS connection path with certificate-required,
   hostname-verified TLS.
-- Angel instrument-master data used by the future scanner must come from a
+- Angel instrument-master data used by the scanner must come from a
   validated local last-known-good cache. Never download the entire master on
   the trading path and never guess missing tokens.
 - Validate exchange, symbol token, trading symbol, and tick size against that
   cached master.
-- Future NSE equity candidates must be intersected with Angel One's current
-  intraday-allowed list before they can become eligible for live orders.
+- NSE equity scanner candidates must be intersected with Angel One's current
+  intraday-allowed list; later phases must repeat that check before live orders.
+
+## Phase 2 market-intelligence boundary
+- Reference-data downloads are explicit maintenance commands only. Recorder,
+  replay, and scanner startup read validated local caches and never refresh them.
+- Instrument, current NSE intraday-allowed, and NIFTY 500 snapshots use complete
+  validation plus atomic last-known-good replacement. Missing, corrupt, stale,
+  ambiguous, or unmapped data suppresses readiness.
+- The Angel intraday-allowed snapshot must be from the current IST trading date;
+  its broker multiplier is diagnostic data and must never increase risk.
+- Model feed reconnects as new sequence epochs. Duplicate/out-of-order ticks do
+  not mutate candles, and gaps remain untrusted until configured recovery.
+- Align one-minute and five-minute candles to the 09:15 IST NSE cash-session
+  boundary. Persist only completed candles under idempotent keys.
+- Indicators must be replay-safe, use completed/trusted history only, and return
+  NOT_READY during warm-up. Relative volume compares the same session minute
+  against complete/trusted local sessions.
+- Scanner rankings are deterministic analysis only. They contain no quantity,
+  executable entry, paper fill, or broker order instruction.
 
 ## Development sequence
 1. Project skeleton and config.

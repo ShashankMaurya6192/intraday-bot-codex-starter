@@ -48,6 +48,12 @@ class FakeRestClient:
     def getfeedToken(self) -> str:
         return "feed-token-fallback"
 
+    def nseIntraday(self) -> dict[str, Any]:
+        return {
+            "status": True,
+            "data": [{"Exchange": "NSE", "SymbolName": "SBIN", "Multiplier": "5"}],
+        }
+
 
 class FakeWebSocket:
     def __init__(self, payload: dict[str, Any] | None = None) -> None:
@@ -157,6 +163,22 @@ def test_authentication_fails_closed_on_rejected_response() -> None:
 
     with pytest.raises(BrokerAuthenticationError, match="rejected"):
         adapter.authenticate()
+
+
+def test_authenticated_intraday_reference_request_has_no_order_capability() -> None:
+    rest = FakeRestClient(_session_response())
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        totp_provider=lambda _secret: "123456",
+        clock=lambda: FIXED_NOW,
+    )
+
+    response = adapter.fetch_nse_intraday()
+
+    assert response["status"] is True
+    assert not hasattr(adapter, "place_order")
+    assert not hasattr(adapter, "cancel_order")
 
 
 def test_sdk_log_filter_redacts_known_secrets_and_auth_headers() -> None:
