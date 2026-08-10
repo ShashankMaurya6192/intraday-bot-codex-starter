@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import ssl
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -14,7 +16,11 @@ from trading_bot.broker import (
     MarketDataConnectionError,
     ReconnectPolicy,
 )
-from trading_bot.broker.angel import _SecretRedactionFilter
+from trading_bot.broker.angel import (
+    VerifiedTLSSmartWebSocketV2,
+    _SecretRedactionFilter,
+    _verified_websocket_factory,
+)
 from trading_bot.domain import (
     IST,
     Exchange,
@@ -69,6 +75,17 @@ class FakeWebSocket:
     def close_connection(self) -> None:
         self.closed = True
         self.on_close(self)
+
+
+class ManualMonotonic:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def _credentials() -> AngelCredentials:
@@ -162,6 +179,40 @@ def test_sdk_log_filter_redacts_known_secrets_and_auth_headers() -> None:
     assert "api-key" not in rendered
     assert "client-code" not in rendered
     assert "dynamically-issued-jwt" not in rendered
+
+
+def test_production_websocket_transport_requires_verified_tls(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeWebSocketApp:
+        def __init__(self, url: str, **kwargs: object) -> None:
+            captured["url"] = url
+            captured["headers"] = kwargs["header"]
+
+        def run_forever(self, **kwargs: object) -> None:
+            captured["run_forever"] = kwargs
+
+    monkeypatch.setattr(
+        "trading_bot.broker.angel.websocket.WebSocketApp",
+        FakeWebSocketApp,
+    )
+    transport = _verified_websocket_factory(
+        "Bearer jwt",
+        "api-key",
+        "client-code",
+        "feed-token",
+    )
+
+    assert isinstance(transport, VerifiedTLSSmartWebSocketV2)
+    transport.connect()
+
+    run_options = captured["run_forever"]
+    assert isinstance(run_options, dict)
+    ssl_options = run_options["sslopt"]
+    assert isinstance(ssl_options, dict)
+    assert ssl_options["cert_reqs"] == ssl.CERT_REQUIRED
+    assert ssl_options["cert_reqs"] != ssl.CERT_NONE
+    assert ssl_options["check_hostname"] is True
 
 
 def test_normalizes_smartapi_paise_and_milliseconds() -> None:
@@ -266,6 +317,231 @@ def test_reconnect_attempts_are_bounded_with_capped_backoff() -> None:
 
     assert connection_count == 4
     assert delays == [1, 3, 4]
+
+
+def test_open_then_immediate_close_repeatedly_exhausts_retries() -> None:
+    rest = FakeRestClient(_session_response())
+    delays: list[float] = []
+    connection_count = 0
+    monotonic = ManualMonotonic()
+
+    class FlappingWebSocket(FakeWebSocket):
+        def connect(self) -> None:
+            nonlocal connection_count
+            connection_count += 1
+            self.on_open(self)
+            self.on_close(self)
+
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        websocket_factory=lambda *_: FlappingWebSocket(),
+        totp_provider=lambda _secret: "123456",
+        reconnect_policy=ReconnectPolicy(
+            max_attempts=2,
+            initial_delay_seconds=1,
+            multiplier=2,
+            max_delay_seconds=5,
+            stable_connection_seconds=30,
+        ),
+        monotonic_clock=monotonic,
+        sleeper=delays.append,
+        clock=lambda: FIXED_NOW,
+    )
+
+    with pytest.raises(MarketDataConnectionError, match="bounded retries"):
+        adapter.stream(
+            [MarketSubscription(Exchange.NSE_CM, "3045")],
+            lambda _tick: None,
+        )
+
+    assert connection_count == 3
+    assert delays == [1, 2]
+
+
+def test_stable_connection_resets_prior_failure_streak() -> None:
+    rest = FakeRestClient(_session_response())
+    delays: list[float] = []
+    monotonic = ManualMonotonic()
+    sockets_created = 0
+    adapter: AngelOneMarketDataAdapter
+
+    class FailBeforeOpen(FakeWebSocket):
+        def connect(self) -> None:
+            raise OSError("handshake failed")
+
+    class StableThenClose(FakeWebSocket):
+        def connect(self) -> None:
+            self.on_open(self)
+            monotonic.advance(31)
+            self.on_close(self)
+
+    class UserDisconnect(FakeWebSocket):
+        def connect(self) -> None:
+            self.on_open(self)
+            adapter.disconnect()
+
+    def websocket_factory(*_: str) -> FakeWebSocket:
+        nonlocal sockets_created
+        sockets_created += 1
+        if sockets_created == 1:
+            return FailBeforeOpen()
+        if sockets_created == 2:
+            return StableThenClose()
+        return UserDisconnect()
+
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        websocket_factory=websocket_factory,
+        totp_provider=lambda _secret: "123456",
+        reconnect_policy=ReconnectPolicy(
+            max_attempts=2,
+            initial_delay_seconds=1,
+            multiplier=2,
+            max_delay_seconds=5,
+            stable_connection_seconds=30,
+        ),
+        monotonic_clock=monotonic,
+        sleeper=delays.append,
+        clock=lambda: FIXED_NOW,
+    )
+
+    adapter.stream(
+        [MarketSubscription(Exchange.NSE_CM, "3045")],
+        lambda _tick: None,
+    )
+
+    assert sockets_created == 3
+    assert delays == [1, 1]
+
+
+def test_user_requested_disconnect_does_not_retry() -> None:
+    rest = FakeRestClient(_session_response())
+    delays: list[float] = []
+    socket = FakeWebSocket(_payload())
+    adapter: AngelOneMarketDataAdapter
+
+    def stop_on_tick(_tick: object) -> None:
+        adapter.disconnect()
+
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        websocket_factory=lambda *_: socket,
+        totp_provider=lambda _secret: "123456",
+        sleeper=delays.append,
+        clock=lambda: FIXED_NOW,
+    )
+
+    adapter.stream(
+        [MarketSubscription(Exchange.NSE_CM, "3045")],
+        stop_on_tick,
+    )
+
+    assert socket.closed is True
+    assert delays == []
+
+
+def test_smartapi_subscription_quota_accepts_1000() -> None:
+    rest = FakeRestClient(_session_response())
+    socket = FakeWebSocket()
+    adapter: AngelOneMarketDataAdapter
+
+    class DisconnectAfterOpen(FakeWebSocket):
+        def connect(self) -> None:
+            self.on_open(self)
+            adapter.disconnect()
+
+    socket = DisconnectAfterOpen()
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        websocket_factory=lambda *_: socket,
+        totp_provider=lambda _secret: "123456",
+        clock=lambda: FIXED_NOW,
+    )
+    subscriptions = [
+        MarketSubscription(Exchange.NSE_CM, str(token)) for token in range(1, 1_001)
+    ]
+
+    adapter.stream(subscriptions, lambda _tick: None)
+
+    assert socket.subscription is not None
+    assert len(socket.subscription[2][0]["tokens"]) == 1_000
+
+
+def test_smartapi_subscription_quota_rejects_1001_before_authentication() -> None:
+    rest_created = False
+    socket_created = False
+
+    def rest_factory(_api_key: str) -> FakeRestClient:
+        nonlocal rest_created
+        rest_created = True
+        return FakeRestClient(_session_response())
+
+    def websocket_factory(*_: str) -> FakeWebSocket:
+        nonlocal socket_created
+        socket_created = True
+        return FakeWebSocket()
+
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=rest_factory,
+        websocket_factory=websocket_factory,
+        totp_provider=lambda _secret: "123456",
+        clock=lambda: FIXED_NOW,
+    )
+    subscriptions = [
+        MarketSubscription(Exchange.NSE_CM, str(token)) for token in range(1, 1_002)
+    ]
+
+    with pytest.raises(ValueError, match="at most 1000"):
+        adapter.stream(subscriptions, lambda _tick: None)
+
+    assert rest_created is False
+    assert socket_created is False
+
+
+def test_adapter_rejects_a_second_concurrent_websocket() -> None:
+    rest = FakeRestClient(_session_response())
+    connected = threading.Event()
+    release = threading.Event()
+
+    class BlockingWebSocket(FakeWebSocket):
+        def connect(self) -> None:
+            self.on_open(self)
+            connected.set()
+            assert release.wait(1)
+
+    adapter = AngelOneMarketDataAdapter(
+        _credentials(),
+        rest_factory=lambda _api_key: rest,
+        websocket_factory=lambda *_: BlockingWebSocket(),
+        totp_provider=lambda _secret: "123456",
+        clock=lambda: FIXED_NOW,
+    )
+    subscription = [MarketSubscription(Exchange.NSE_CM, "3045")]
+    first_error: list[BaseException] = []
+
+    def run_first_stream() -> None:
+        try:
+            adapter.stream(subscription, lambda _tick: None)
+        except BaseException as exc:
+            first_error.append(exc)
+
+    thread = threading.Thread(target=run_first_stream)
+    thread.start()
+    assert connected.wait(1)
+
+    with pytest.raises(MarketDataConnectionError, match="only one"):
+        adapter.stream(subscription, lambda _tick: None)
+
+    adapter.disconnect()
+    release.set()
+    thread.join(1)
+    assert not thread.is_alive()
+    assert first_error == []
 
 
 def test_event_recorder_failure_stops_before_connecting() -> None:

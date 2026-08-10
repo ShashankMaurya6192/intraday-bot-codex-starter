@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import logging
 import re
+import ssl
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Protocol, cast
+
+import websocket
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 from trading_bot.domain import (
     IST,
@@ -54,6 +59,8 @@ _SMARTAPI_TO_MODE = {value: key for key, value in _MODE_TO_SMARTAPI.items()}
 
 _PAISE_PER_RUPEE = Decimal("100")
 _CURRENCY_PRICE_DIVISOR = Decimal("10000000")
+_SUPPORTED_SMARTAPI_SDK_VERSION = "1.5.5"
+_MAX_TOKEN_MODE_SUBSCRIPTIONS = 1_000
 _SENSITIVE_HEADER_PATTERN = re.compile(
     r"(?i)((?:authorization|x-api-key|x-client-code|x-feed-token|"
     r"x-privatekey)['\"]?\s*[:=]\s*['\"]?)(?:bearer\s+)?[^'\"\s,}]+"
@@ -91,6 +98,7 @@ WebSocketFactory = Callable[[str, str, str, str], _WebSocketClient]
 TotpProvider = Callable[[str], str]
 Clock = Callable[[], datetime]
 Sleeper = Callable[[float], None]
+MonotonicClock = Callable[[], float]
 
 
 class _SecretRedactionFilter(logging.Filter):
@@ -135,21 +143,64 @@ class AngelCredentials:
         )
 
 
+class VerifiedTLSSmartWebSocketV2(SmartWebSocketV2):
+    """SmartAPI 1.5.5 transport with certificate verification restored.
+
+    The pinned SDK's parser, subscription logic, heartbeat handling, and callback
+    adapters are inherited unchanged. Only ``connect`` is replaced because the
+    upstream implementation explicitly passes ``ssl.CERT_NONE``.
+    """
+
+    def connect(self) -> None:
+        headers = {
+            "Authorization": self.auth_token,
+            "x-api-key": self.api_key,
+            "x-client-code": self.client_code,
+            "x-feed-token": self.feed_token,
+        }
+        self.wsapp = websocket.WebSocketApp(
+            self.ROOT_URI,
+            header=headers,
+            on_open=self._on_open,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            on_data=self._on_data,
+            on_ping=self._on_ping,
+            on_pong=self._on_pong,
+        )
+        self.wsapp.run_forever(
+            sslopt={
+                "cert_reqs": ssl.CERT_REQUIRED,
+                "check_hostname": True,
+            },
+            ping_interval=self.HEART_BEAT_INTERVAL,
+        )
+
+
 def _official_rest_factory(api_key: str) -> _RestClient:
     from SmartApi import SmartConnect
 
     return cast(_RestClient, SmartConnect(api_key=api_key))
 
 
-def _official_websocket_factory(
+def _verified_websocket_factory(
     access_token: str, api_key: str, client_code: str, feed_token: str
 ) -> _WebSocketClient:
-    from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+    try:
+        installed_version = version("smartapi-python")
+    except PackageNotFoundError as exc:
+        raise MarketDataConnectionError(
+            "the pinned smartapi-python SDK is not installed"
+        ) from exc
+    if installed_version != _SUPPORTED_SMARTAPI_SDK_VERSION:
+        raise MarketDataConnectionError(
+            "unsupported smartapi-python version for the verified TLS wrapper"
+        )
 
     # Reconnection is managed by this adapter so retry timing is bounded and testable.
     return cast(
         _WebSocketClient,
-        SmartWebSocketV2(
+        VerifiedTLSSmartWebSocketV2(
             access_token,
             api_key,
             client_code,
@@ -176,9 +227,10 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         correlation_id: str = "intraday01",
         reconnect_policy: ReconnectPolicy | None = None,
         rest_factory: RestFactory = _official_rest_factory,
-        websocket_factory: WebSocketFactory = _official_websocket_factory,
+        websocket_factory: WebSocketFactory = _verified_websocket_factory,
         totp_provider: TotpProvider = _official_totp_provider,
         clock: Clock | None = None,
+        monotonic_clock: MonotonicClock = time.monotonic,
         sleeper: Sleeper = time.sleep,
     ) -> None:
         if not 1 <= len(correlation_id) <= 10 or not correlation_id.isalnum():
@@ -186,7 +238,7 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         if subscription_mode is SubscriptionMode.DEPTH:
             # SmartAPI depth has tighter exchange/token limits. It is deliberately
             # excluded from the initial equity recorder until separately tested.
-            raise ValueError("DEPTH mode is not supported by the Phase 1 adapter")
+            raise ValueError("DEPTH mode is not supported by the Phase 1.5 adapter")
 
         self._credentials = credentials
         self._subscription_mode = subscription_mode
@@ -196,16 +248,18 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         self._websocket_factory = websocket_factory
         self._totp_provider = totp_provider
         self._clock = clock or (lambda: datetime.now(IST))
+        self._monotonic_clock = monotonic_clock
         self._sleeper = sleeper
 
         self._session: BrokerSession | None = None
         self._rest_client: _RestClient | None = None
         self._socket: _WebSocketClient | None = None
         self._socket_lock = threading.RLock()
+        self._stream_lock = threading.Lock()
         self._stop_requested = threading.Event()
         self._callback_failure: Exception | None = None
         self._event_handler: FeedEventHandler | None = None
-        self._connection_opened = False
+        self._connection_opened_at: float | None = None
         self._sdk_log_filter: _SecretRedactionFilter | None = None
 
     @property
@@ -272,9 +326,29 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         on_tick: TickHandler,
         on_event: FeedEventHandler | None = None,
     ) -> None:
+        if not self._stream_lock.acquire(blocking=False):
+            raise MarketDataConnectionError(
+                "only one SmartAPI WebSocket connection is supported per adapter"
+            )
+        try:
+            self._run_stream(subscriptions, on_tick, on_event)
+        finally:
+            self._stream_lock.release()
+
+    def _run_stream(
+        self,
+        subscriptions: Sequence[MarketSubscription],
+        on_tick: TickHandler,
+        on_event: FeedEventHandler | None,
+    ) -> None:
         subscriptions = tuple(subscriptions)
         if not subscriptions:
             raise ValueError("at least one market-data subscription is required")
+        if len(subscriptions) > _MAX_TOKEN_MODE_SUBSCRIPTIONS:
+            raise ValueError(
+                "SmartAPI supports at most 1000 token-mode subscriptions "
+                "per WebSocket connection"
+            )
         if len({(item.exchange, item.symbol_token) for item in subscriptions}) != len(
             subscriptions
         ):
@@ -307,11 +381,11 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
             for item in subscriptions
         }
         token_list = self._build_token_list(subscriptions)
-        retry_attempt = 0
+        failure_streak = 0
         last_error: Exception | None = None
 
         while not self._stop_requested.is_set():
-            self._connection_opened = False
+            self._connection_opened_at = None
             try:
                 socket = self._websocket_factory(
                     session.access_token,
@@ -339,25 +413,42 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
                 ) from self._callback_failure
             if self._stop_requested.is_set():
                 return
-            if self._connection_opened:
-                # A connection that reached on_open breaks a run of failed attempts.
-                retry_attempt = 0
-            if retry_attempt >= self._reconnect_policy.max_attempts:
+
+            connection_duration: float | None = None
+            stable_connection = False
+            if self._connection_opened_at is not None:
+                connection_duration = max(
+                    0.0,
+                    self._monotonic_clock() - self._connection_opened_at,
+                )
+                stable_connection = (
+                    connection_duration
+                    >= self._reconnect_policy.stable_connection_seconds
+                )
+                if stable_connection:
+                    failure_streak = 0
+
+            if failure_streak >= self._reconnect_policy.max_attempts:
                 self._emit(
                     FeedEventType.ERROR,
                     "Angel One market-data reconnect attempts exhausted",
-                    {"attempts": retry_attempt},
+                    {"attempts": failure_streak},
                 )
                 raise MarketDataConnectionError(
                     "Angel One market-data stream stopped after bounded retries"
                 ) from last_error
 
-            retry_attempt += 1
-            delay = self._reconnect_policy.delay_for_attempt(retry_attempt)
+            failure_streak += 1
+            delay = self._reconnect_policy.delay_for_attempt(failure_streak)
             self._emit(
                 FeedEventType.RECONNECTING,
                 "Reconnecting Angel One market-data stream",
-                {"attempt": retry_attempt, "delay_seconds": delay},
+                {
+                    "attempt": failure_streak,
+                    "delay_seconds": delay,
+                    "connection_duration_seconds": connection_duration,
+                    "stable_connection": stable_connection,
+                },
             )
             self._sleeper(delay)
 
@@ -427,7 +518,7 @@ class AngelOneMarketDataAdapter(MarketDataBroker):
         on_tick: TickHandler,
     ) -> None:
         def on_open(*_: object) -> None:
-            self._connection_opened = True
+            self._connection_opened_at = self._monotonic_clock()
             self._emit(
                 FeedEventType.CONNECTED,
                 "Angel One market-data WebSocket connected",

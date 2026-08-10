@@ -13,6 +13,9 @@ def test_default_is_paper() -> None:
     assert settings.trading_mode is TradingMode.PAPER
     assert settings.live_trading_enabled is False
     assert settings.risk_per_trade_pct == Decimal("0.003")
+    assert settings.websocket_stable_connection_seconds == 30
+    assert settings.tick_ingestion_queue_capacity == 10_000
+    assert settings.tick_ingestion_batch_size == 250
 
 
 def test_live_requires_both_feature_gate_and_startup_confirmation() -> None:
@@ -83,3 +86,12 @@ def test_secrets_are_redacted() -> None:
     assert "api-secret" not in rendered
     assert "pin-secret" not in rendered
     assert settings.angel_credentials_configured is True
+
+
+def test_ingestion_batch_cannot_exceed_queue_capacity() -> None:
+    with pytest.raises(ValidationError, match="batch size"):
+        Settings(
+            _env_file=None,
+            tick_ingestion_queue_capacity=10,
+            tick_ingestion_batch_size=11,
+        )

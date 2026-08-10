@@ -123,11 +123,32 @@ Suggested modules:
 - Structured logs.
 - SQLite is sufficient initially.
 - Reconnect WebSocket with bounded exponential backoff.
+- Verify WebSocket TLS certificates and hostnames; never use `ssl.CERT_NONE`.
+- Count short-lived WebSocket opens as failures. Reset the reconnect streak only
+  after the configured stable-connection interval.
+- Use one SmartAPI market-data WebSocket with no more than 1000 token-mode
+  subscriptions until an explicitly tested sharding design exists.
+- Keep broker callbacks lightweight by using a bounded tick queue and dedicated
+  batch writer. Queue overflow, writer failure, or drain timeout is unsafe and
+  must stop the feed without silently dropping ticks.
 - Persist enough state to reconcile safely after restart.
 - Separate signal generation from execution.
 - Strategy code must never call broker order methods directly.
 - Add dry-run CLI commands before live commands.
 - Prefer simple, inspectable code over clever abstractions.
+
+## Phase 1.5 hardening boundary
+- The supported SmartAPI Python SDK is pinned to `smartapi-python==1.5.5`.
+- The project transport must preserve the SDK parser/protocol behavior while
+  overriding its unverified TLS connection path with certificate-required,
+  hostname-verified TLS.
+- Angel instrument-master data used by the future scanner must come from a
+  validated local last-known-good cache. Never download the entire master on
+  the trading path and never guess missing tokens.
+- Validate exchange, symbol token, trading symbol, and tick size against that
+  cached master.
+- Future NSE equity candidates must be intersected with Angel One's current
+  intraday-allowed list before they can become eligible for live orders.
 
 ## Development sequence
 1. Project skeleton and config.

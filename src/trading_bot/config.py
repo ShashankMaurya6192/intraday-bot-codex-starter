@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     websocket_reconnect_initial_delay_seconds: float = Field(default=1.0, ge=0, le=60)
     websocket_reconnect_multiplier: float = Field(default=2.0, ge=1, le=10)
     websocket_reconnect_max_delay_seconds: float = Field(default=30.0, ge=0, le=300)
+    websocket_stable_connection_seconds: float = Field(default=30.0, gt=0, le=3600)
+
+    tick_ingestion_queue_capacity: int = Field(default=10_000, ge=1, le=1_000_000)
+    tick_ingestion_batch_size: int = Field(default=250, ge=1, le=10_000)
+    tick_ingestion_flush_interval_seconds: float = Field(default=0.05, gt=0, le=5)
+    tick_ingestion_shutdown_timeout_seconds: float = Field(default=10.0, gt=0, le=300)
 
     risk_per_trade_pct: Decimal = Field(default=Decimal("0.003"), gt=0, le=1)
     max_daily_loss_pct: Decimal = Field(default=Decimal("0.009"), gt=0, le=1)
@@ -89,6 +95,15 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "websocket reconnect initial delay cannot exceed maximum delay"
+            )
+        if self.tick_ingestion_batch_size > self.tick_ingestion_queue_capacity:
+            raise ValueError("tick ingestion batch size cannot exceed queue capacity")
+        if (
+            self.tick_ingestion_flush_interval_seconds
+            > self.tick_ingestion_shutdown_timeout_seconds
+        ):
+            raise ValueError(
+                "tick ingestion flush interval cannot exceed shutdown timeout"
             )
         return self
 

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 from .broker import AngelCredentials, AngelOneMarketDataAdapter, ReconnectPolicy
 from .config import Settings
-from .storage import SQLiteMarketRecorder
+from .storage import SQLiteMarketRecorder, TickIngestionService
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -14,7 +14,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Paper-first Angel One intraday market-data recorder",
     )
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("status", help="show redacted Phase 1 configuration status")
+    subparsers.add_parser("status", help="show redacted Phase 1.5 configuration status")
     subparsers.add_parser("init-db", help="create or migrate the SQLite recorder")
     subparsers.add_parser(
         "record-market",
@@ -27,7 +27,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = Settings()
 
-    # Phase 1 intentionally has no explicit-live confirmation path. Any LIVE
+    # Phase 1.5 intentionally has no explicit-live confirmation path. Any LIVE
     # configuration therefore fails closed before a command runs.
     settings.assert_live_allowed()
     command = args.command or "status"
@@ -72,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             initial_delay_seconds=settings.websocket_reconnect_initial_delay_seconds,
             multiplier=settings.websocket_reconnect_multiplier,
             max_delay_seconds=settings.websocket_reconnect_max_delay_seconds,
+            stable_connection_seconds=settings.websocket_stable_connection_seconds,
         )
         adapter = AngelOneMarketDataAdapter(
             credentials,
@@ -83,6 +84,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings.database_url,
             busy_timeout_ms=settings.database_busy_timeout_ms,
         ) as recorder:
+            ingestion = TickIngestionService(
+                recorder,
+                queue_capacity=settings.tick_ingestion_queue_capacity,
+                batch_size=settings.tick_ingestion_batch_size,
+                flush_interval_seconds=(settings.tick_ingestion_flush_interval_seconds),
+                shutdown_timeout_seconds=(
+                    settings.tick_ingestion_shutdown_timeout_seconds
+                ),
+                on_unhealthy=lambda _error: adapter.disconnect(),
+            )
+            ingestion.start()
             print(
                 f"Recording {len(subscriptions)} subscription(s) in PAPER mode. "
                 "Press Ctrl+C to stop."
@@ -90,13 +102,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 adapter.stream(
                     subscriptions,
-                    recorder.record_tick,
+                    ingestion.submit,
                     recorder.record_feed_event,
                 )
             except KeyboardInterrupt:
                 print("Stopping market recorder...")
             finally:
                 adapter.disconnect()
+                ingestion.stop(raise_on_failure=False)
+            if ingestion.failure is not None:
+                raise ingestion.failure
         return 0
 
     raise AssertionError(f"unhandled command: {command}")

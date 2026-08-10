@@ -1,6 +1,6 @@
 """Broker boundaries for authentication and market data only.
 
-Order placement intentionally does not exist in the Phase 1 interfaces.
+Order placement intentionally does not exist in the Phase 1.5 interfaces.
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ class ReconnectPolicy:
     initial_delay_seconds: float = 1.0
     multiplier: float = 2.0
     max_delay_seconds: float = 30.0
+    stable_connection_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.max_attempts < 0:
@@ -76,6 +77,8 @@ class ReconnectPolicy:
             raise ValueError("reconnect multiplier must be at least 1")
         if self.initial_delay_seconds > self.max_delay_seconds:
             raise ValueError("initial reconnect delay cannot exceed maximum delay")
+        if self.stable_connection_seconds <= 0:
+            raise ValueError("stable_connection_seconds must be positive")
 
     def delay_for_attempt(self, attempt: int) -> float:
         """Return the capped delay before a one-based retry attempt."""
