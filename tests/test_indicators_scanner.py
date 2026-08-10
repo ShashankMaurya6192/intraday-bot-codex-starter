@@ -77,7 +77,7 @@ def _health(
         data_age_seconds=0.0,
         duplicate_count=0,
         out_of_order_count=0,
-        sequence_gap_count=0,
+        sequence_jump_count=0,
         last_health_transition=at,
     )
 

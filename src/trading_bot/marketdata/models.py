@@ -38,7 +38,7 @@ class InstrumentHealth:
     data_age_seconds: float | None
     duplicate_count: int
     out_of_order_count: int
-    sequence_gap_count: int
+    sequence_jump_count: int
     last_health_transition: datetime
 
     @property

@@ -63,7 +63,7 @@ Requirements:
 - If mapping is ambiguous or missing, exclude the item and surface the reason in diagnostics rather than guessing.
 - Make the scanner universe configurable so tests and early live smoke tests can use 5-20 symbols.
 
-## 5. Tick health and sequence monitoring
+## 5. Tick health and sequence telemetry
 
 Build a broker-neutral market-data health layer before candle generation.
 
@@ -74,17 +74,22 @@ For each instrument track:
 - data age;
 - duplicate count;
 - out-of-order count;
-- sequence-gap count;
+- positive sequence-jump count (telemetry only);
 - last health transition.
 
 Requirements:
 - Use `MARKET_DATA_STALE_AFTER_SECONDS`.
 - A stale instrument is ineligible for signals.
 - Out-of-order ticks must not mutate completed candle state incorrectly.
-- A material sequence gap transitions the instrument to degraded/untrusted until a clearly defined recovery condition is met.
+- Do not infer packet loss from per-token sequence contiguity. Angel multiplexes
+  instruments on one stream, so positive per-token jumps are expected and must
+  not degrade health.
+- Exact duplicates and older exchange timestamps remain fail-closed and must not
+  mutate candle state. Sequence direction alone is not an ordering signal.
 - Do not assume sequence numbers survive broker reconnects unchanged. Model reconnect/feed epochs explicitly if necessary.
 - Expose health diagnostics for the CLI/scanner.
-- Tests must cover stale ticks, duplicates, out-of-order ticks, gaps, reconnect epochs, and recovery.
+- Tests must cover stale ticks, exact duplicates, out-of-order ticks, sparse
+  increasing sequences, interleaved tokens, reconnect epochs, and recovery.
 
 ## 6. Candle aggregation
 

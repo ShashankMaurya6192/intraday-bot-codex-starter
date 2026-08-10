@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+from trading_bot.broker import BrokerInstrument
 from trading_bot.domain import (
     IST,
     Exchange,
@@ -18,6 +19,7 @@ from trading_bot.marketdata import (
     MarketReplayEngine,
     SessionCandleAggregator,
 )
+from trading_bot.scanner import MarketScanner, ScannerReadiness
 from trading_bot.storage import SQLiteMarketRecorder
 
 BASE = datetime(2026, 8, 10, 9, 15, tzinfo=IST)
@@ -45,7 +47,7 @@ def _tick(
     )
 
 
-def test_health_tracks_stale_duplicate_out_of_order_gap_and_recovery() -> None:
+def test_health_tracks_stale_duplicate_timestamp_regression_and_recovery() -> None:
     monitor = MarketDataHealthMonitor(
         stale_after_seconds=5,
         recovery_consecutive_ticks=3,
@@ -53,24 +55,26 @@ def test_health_tracks_stale_duplicate_out_of_order_gap_and_recovery() -> None:
     first = monitor.observe(_tick(1, 0))
     assert first.health.status is MarketDataHealthStatus.READY
 
-    duplicate = monitor.observe(_tick(1, 1))
+    duplicate = monitor.observe(_tick(1, 0))
     assert duplicate.accepted is False
     assert duplicate.reason == "duplicate"
     assert duplicate.health.duplicate_count == 1
 
-    out_of_order = monitor.observe(_tick(0, 2))
+    out_of_order = monitor.observe(
+        _tick(4, -1), now=BASE + timedelta(seconds=2)
+    )
     assert out_of_order.accepted is False
     assert out_of_order.health.out_of_order_count == 1
     assert out_of_order.health.status is MarketDataHealthStatus.DEGRADED
 
-    gap = monitor.observe(_tick(4, 3))
-    assert gap.accepted is True
-    assert gap.trusted is False
-    assert gap.health.sequence_gap_count == 1
+    recovering_jump = monitor.observe(_tick(4, 3))
+    assert recovering_jump.accepted is True
+    assert recovering_jump.trusted is False
+    assert recovering_jump.reason == "recovering"
+    assert recovering_jump.health.sequence_jump_count == 1
 
     assert monitor.observe(_tick(5, 4)).reason == "recovering"
-    assert monitor.observe(_tick(6, 5)).reason == "recovering"
-    recovered = monitor.observe(_tick(7, 6))
+    recovered = monitor.observe(_tick(6, 5))
     assert recovered.trusted is True
     assert recovered.health.status is MarketDataHealthStatus.READY
 
@@ -80,7 +84,73 @@ def test_health_tracks_stale_duplicate_out_of_order_gap_and_recovery() -> None:
         now=BASE + timedelta(seconds=20),
     )
     assert stale.status is MarketDataHealthStatus.STALE
-    assert stale.data_age_seconds == 14
+    assert stale.data_age_seconds == 15
+
+
+def test_lower_sequence_with_later_exchange_timestamp_remains_trusted() -> None:
+    monitor = MarketDataHealthMonitor(stale_after_seconds=5)
+
+    first = monitor.observe(_tick(1200, 0))
+    lower = monitor.observe(_tick(100, 1))
+
+    assert first.trusted is True
+    assert lower.accepted is True
+    assert lower.trusted is True
+    assert lower.reason == "healthy"
+    assert lower.health.status is MarketDataHealthStatus.READY
+    assert lower.health.sequence_number == 100
+    assert lower.health.out_of_order_count == 0
+
+
+def test_same_sequence_with_later_exchange_timestamp_is_not_a_duplicate() -> None:
+    monitor = MarketDataHealthMonitor(stale_after_seconds=5)
+
+    monitor.observe(_tick(100, 0))
+    later = monitor.observe(_tick(100, 1))
+
+    assert later.accepted is True
+    assert later.trusted is True
+    assert later.reason == "healthy"
+    assert later.health.duplicate_count == 0
+
+
+def test_sparse_increasing_smartapi_sequences_remain_trusted() -> None:
+    monitor = MarketDataHealthMonitor(stale_after_seconds=5)
+
+    assessments = [
+        monitor.observe(_tick(sequence, offset))
+        for offset, sequence in enumerate((100, 150, 892, 1200))
+    ]
+
+    assert all(item.accepted and item.trusted for item in assessments)
+    assert all(item.reason == "healthy" for item in assessments)
+    assert assessments[-1].health.status is MarketDataHealthStatus.READY
+    assert assessments[-1].health.sequence_number == 1200
+    assert assessments[-1].health.sequence_jump_count == 3
+    assert assessments[-1].health.out_of_order_count == 0
+
+
+def test_interleaved_six_symbol_smartapi_sequences_remain_trusted() -> None:
+    monitor = MarketDataHealthMonitor(stale_after_seconds=5)
+    assessments = []
+    for round_number, sequence_base in enumerate((100, 150, 892, 1200)):
+        for token_number in range(1, 7):
+            assessments.append(
+                monitor.observe(
+                    _tick(
+                        sequence_base + token_number - 1,
+                        round_number,
+                        token=str(token_number),
+                    )
+                )
+            )
+
+    assert all(item.accepted and item.trusted for item in assessments)
+    health = monitor.all_health(now=BASE + timedelta(seconds=3, milliseconds=100))
+    assert len(health) == 6
+    assert all(item.status is MarketDataHealthStatus.READY for item in health)
+    assert all(item.sequence_jump_count == 3 for item in health)
+    assert all(item.out_of_order_count == 0 for item in health)
 
 
 def test_health_models_reconnect_as_a_new_feed_epoch() -> None:
@@ -89,12 +159,15 @@ def test_health_models_reconnect_as_a_new_feed_epoch() -> None:
         recovery_consecutive_ticks=2,
     )
     monitor.observe(_tick(100, 0))
+    before_reconnect = monitor.observe(_tick(150, 1))
+    assert before_reconnect.health.sequence_jump_count == 1
     epoch = monitor.begin_feed_epoch(at=BASE + timedelta(seconds=1))
 
     assert epoch == 1
     first_after_reconnect = monitor.observe(_tick(1, 2))
     assert first_after_reconnect.reason == "recovering"
     assert first_after_reconnect.health.feed_epoch == 1
+    assert first_after_reconnect.health.sequence_jump_count == 0
     recovered = monitor.observe(_tick(2, 3))
     assert recovered.reason == "healthy"
     assert recovered.trusted is True
@@ -114,6 +187,83 @@ def test_replay_applies_explicit_reconnect_epochs_and_recovery() -> None:
     assert result.health[0].status is MarketDataHealthStatus.READY
     assert result.accepted_ticks == 3
     assert any(not candle.trusted for candle in result.candles)
+
+
+class _NoBaselines:
+    def load_rvol_baselines(self, **_kwargs):
+        return ()
+
+
+def test_six_symbol_replay_does_not_report_sequence_jumps_as_untrusted() -> None:
+    symbols = (
+        ("1", "HDFCBANK-EQ"),
+        ("2", "INFY-EQ"),
+        ("3", "NIFTY 50"),
+        ("4", "RELIANCE-EQ"),
+        ("5", "SBIN-EQ"),
+        ("6", "TCS-EQ"),
+    )
+    ticks = [
+        _tick(
+            sequence_base + token_index,
+            round_number,
+            token=token,
+        )
+        for round_number, sequence_base in enumerate((100, 900, 1600))
+        for token_index, (token, _symbol) in enumerate(symbols)
+    ]
+    evaluation_at = BASE + timedelta(seconds=3)
+    with SQLiteMarketRecorder("sqlite:///:memory:") as recorder:
+        recorder.record_ticks(ticks)
+        replay = MarketReplayEngine(stale_after_seconds=5).replay_date(
+            recorder,
+            BASE.date(),
+            evaluation_at=evaluation_at,
+            persist=False,
+        )
+    health_by = {
+        (item.exchange, item.symbol_token): item for item in replay.health
+    }
+    candles_by = {
+        (Exchange.NSE_CM, token): tuple(
+            candle for candle in replay.candles if candle.symbol_token == token
+        )
+        for token, _symbol in symbols
+    }
+    equities = tuple(
+        BrokerInstrument(Exchange.NSE_CM, token, symbol, Decimal("0.05"))
+        for token, symbol in symbols
+        if symbol != "NIFTY 50"
+    )
+    benchmark = BrokerInstrument(
+        Exchange.NSE_CM,
+        "3",
+        "NIFTY 50",
+        Decimal("0"),
+        instrument_type="AMXIDX",
+    )
+
+    scan = MarketScanner().scan(
+        instruments=equities,
+        candles_by_instrument=candles_by,
+        health_by_instrument=health_by,
+        benchmark=benchmark,
+        baseline_store=_NoBaselines(),
+        now=evaluation_at,
+        raw_ticks_replayed=replay.raw_ticks_replayed,
+    )
+
+    assert len(replay.health) == 6
+    assert all(item.trusted for item in replay.health)
+    assert all(item.sequence_jump_count == 2 for item in replay.health)
+    assert scan.readiness is ScannerReadiness.NOT_READY
+    assert scan.unhealthy_count == 0
+    assert scan.diagnostics.unhealthy_market_data == ()
+    assert all(
+        "market_data_untrusted" not in message
+        for message in scan.diagnostics.all_messages
+    )
+    assert scan.diagnostics.indicator_not_ready
 
 
 def test_stale_tick_is_never_trusted() -> None:

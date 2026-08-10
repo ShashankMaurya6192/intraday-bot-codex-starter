@@ -737,7 +737,6 @@ def _replay_engine(settings: Settings) -> MarketReplayEngine:
     return MarketReplayEngine(
         stale_after_seconds=settings.market_data_stale_after_seconds,
         recovery_consecutive_ticks=settings.market_data_recovery_consecutive_ticks,
-        allowed_sequence_gap=settings.market_data_allowed_sequence_gap,
     )
 
 

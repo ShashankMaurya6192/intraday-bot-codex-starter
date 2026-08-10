@@ -1,4 +1,4 @@
-"""Epoch-aware tick freshness and sequence monitoring."""
+"""Epoch-aware tick freshness and sequence telemetry."""
 
 from __future__ import annotations
 
@@ -25,30 +25,26 @@ class _State:
     sequence: int | None
     duplicates: int
     out_of_order: int
-    gaps: int
+    sequence_jumps: int
     recovery_ticks: int
     transition_at: datetime
 
 
 class MarketDataHealthMonitor:
-    """Track broker-neutral health without assuming sequences span reconnects."""
+    """Track health without assuming per-instrument sequences are contiguous."""
 
     def __init__(
         self,
         *,
         stale_after_seconds: float,
         recovery_consecutive_ticks: int = 3,
-        allowed_sequence_gap: int = 0,
     ) -> None:
         if stale_after_seconds <= 0:
             raise ValueError("stale_after_seconds must be positive")
         if recovery_consecutive_ticks < 1:
             raise ValueError("recovery_consecutive_ticks must be positive")
-        if allowed_sequence_gap < 0:
-            raise ValueError("allowed_sequence_gap must be non-negative")
         self._stale_after_seconds = stale_after_seconds
         self._recovery_required = recovery_consecutive_ticks
-        self._allowed_gap = allowed_sequence_gap
         self._epoch = 0
         self._states: dict[tuple[Exchange, str], _State] = {}
 
@@ -63,6 +59,7 @@ class MarketDataHealthMonitor:
         for state in self._states.values():
             state.epoch = self._epoch
             state.sequence = None
+            state.sequence_jumps = 0
             state.recovery_ticks = 0
             self._transition(state, MarketDataHealthStatus.DEGRADED, timestamp)
         return self._epoch
@@ -89,23 +86,27 @@ class MarketDataHealthMonitor:
                 sequence=None,
                 duplicates=0,
                 out_of_order=0,
-                gaps=0,
+                sequence_jumps=0,
                 recovery_ticks=0,
                 transition_at=observed_at,
             )
             self._states[key] = state
 
-        if state.sequence is not None and tick.sequence_number == state.sequence:
+        if (
+            state.sequence is not None
+            and tick.sequence_number == state.sequence
+            and state.latest_exchange is not None
+            and tick.exchange_timestamp == state.latest_exchange
+        ):
             state.duplicates += 1
             return TickAssessment(
                 False, False, "duplicate", self._snapshot(state, observed_at)
             )
-        if (
-            state.sequence is not None
-            and tick.sequence_number < state.sequence
-            or state.latest_exchange is not None
+        older_exchange_timestamp = (
+            state.latest_exchange is not None
             and tick.exchange_timestamp < state.latest_exchange
-        ):
+        )
+        if older_exchange_timestamp:
             state.out_of_order += 1
             self._transition(state, MarketDataHealthStatus.DEGRADED, observed_at)
             state.recovery_ticks = 0
@@ -116,23 +117,17 @@ class MarketDataHealthMonitor:
                 self._snapshot(state, observed_at),
             )
 
-        gap = 0
-        if state.sequence is not None:
-            gap = tick.sequence_number - state.sequence - 1
+        if (
+            state.sequence is not None
+            and tick.sequence_number - state.sequence > 1
+        ):
+            # SmartAPI sequences are sparse per token because one stream carries
+            # interleaved instruments. Count jumps as telemetry only; they do not
+            # demonstrate packet loss and must not affect trust.
+            state.sequence_jumps += 1
         state.latest_exchange = tick.exchange_timestamp
         state.latest_received = tick.received_at
         state.sequence = tick.sequence_number
-
-        if gap > self._allowed_gap:
-            state.gaps += 1
-            state.recovery_ticks = 0
-            self._transition(state, MarketDataHealthStatus.DEGRADED, observed_at)
-            return TickAssessment(
-                True,
-                False,
-                "sequence_gap",
-                self._snapshot(state, observed_at),
-            )
 
         age = max(0.0, (observed_at - tick.exchange_timestamp).total_seconds())
         if age > self._stale_after_seconds:
@@ -193,7 +188,7 @@ class MarketDataHealthMonitor:
             data_age_seconds=age,
             duplicate_count=state.duplicates,
             out_of_order_count=state.out_of_order,
-            sequence_gap_count=state.gaps,
+            sequence_jump_count=state.sequence_jumps,
             last_health_transition=state.transition_at,
         )
 

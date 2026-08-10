@@ -75,11 +75,9 @@ class MarketReplayEngine:
         *,
         stale_after_seconds: float,
         recovery_consecutive_ticks: int = 3,
-        allowed_sequence_gap: int = 0,
     ) -> None:
         self._stale_after_seconds = stale_after_seconds
         self._recovery_ticks = recovery_consecutive_ticks
-        self._allowed_gap = allowed_sequence_gap
 
     def replay(
         self,
@@ -92,7 +90,6 @@ class MarketReplayEngine:
         monitor = MarketDataHealthMonitor(
             stale_after_seconds=self._stale_after_seconds,
             recovery_consecutive_ticks=self._recovery_ticks,
-            allowed_sequence_gap=self._allowed_gap,
         )
         aggregator = SessionCandleAggregator()
         candles: list[Candle] = []

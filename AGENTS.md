@@ -158,8 +158,10 @@ Suggested modules:
   ambiguous, or unmapped data suppresses readiness.
 - The Angel intraday-allowed snapshot must be from the current IST trading date;
   its broker multiplier is diagnostic data and must never increase risk.
-- Model feed reconnects as new sequence epochs. Duplicate/out-of-order ticks do
-  not mutate candles, and gaps remain untrusted until configured recovery.
+- Model feed reconnects as new sequence epochs. Exact duplicate and
+  out-of-order-timestamp ticks do not mutate candles. Per-token sequence values,
+  including jumps and decreases, are telemetry only and never independent proof
+  of packet loss or ordering.
 - Align one-minute and five-minute candles to the 09:15 IST NSE cash-session
   boundary. Persist only completed candles under idempotent keys.
 - Indicators must be replay-safe, use completed/trusted history only, and return

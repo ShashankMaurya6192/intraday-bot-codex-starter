@@ -23,6 +23,7 @@ def test_default_is_paper() -> None:
     assert settings.historical_bootstrap_lookback_days == 30
     assert settings.historical_bootstrap_minimum_sessions == 15
     assert settings.scan_replay_hard_tick_limit == 2_000_000
+    assert not hasattr(settings, "market_data_allowed_sequence_gap")
     assert settings.configured_scanner_symbols() == ()
 
 

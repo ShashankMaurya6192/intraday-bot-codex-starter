@@ -70,7 +70,6 @@ class Settings(BaseSettings):
     scan_replay_warning_seconds: float = Field(default=10.0, gt=0, le=3600)
     scan_replay_hard_tick_limit: int = Field(default=2_000_000, ge=1)
     market_data_recovery_consecutive_ticks: int = Field(default=3, ge=1, le=100)
-    market_data_allowed_sequence_gap: int = Field(default=0, ge=0, le=100)
     relative_volume_lookback_sessions: int = Field(default=15, ge=1, le=100)
     relative_volume_minimum_sessions: int = Field(default=10, ge=1, le=100)
     relative_volume_threshold: Decimal = Field(default=Decimal("1.5"), gt=0)

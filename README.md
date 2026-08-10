@@ -20,7 +20,7 @@ There is no paper execution, order interface, or live order-placement code.
   orders.
 - The production WebSocket verifies certificates and hostnames.
 - Reconnects, downloads, queues, and shutdown drains are bounded.
-- Missing, stale, corrupt, ambiguous, sequence-broken, or incomplete data
+- Missing, stale, corrupt, ambiguous, timestamp-disordered, or incomplete data
   suppresses scanner readiness.
 - A Historical API rate-limit response aborts the whole bootstrap immediately;
   it is never retried as a transient error and never advances to another symbol.
@@ -266,7 +266,7 @@ explicit SmartAPI historical diagnostic/bootstrap
   -> local 5m warm-up candles + equity-only RVOL baselines
 
 recorded SmartAPI ticks
-  -> feed-epoch health/sequence monitor
+  -> feed-epoch health monitor + sequence telemetry
   -> deterministic 09:15 IST candle aggregation
   -> idempotent SQLite candles + complete-session RVOL baselines
   -> replay-safe indicators + NIFTY regime
@@ -304,11 +304,19 @@ benchmark failures, and scaling warnings. Counts distinguish requested,
 eligible, expected-ineligible, broken mappings, indicator failures, and
 benchmark failures.
 
-Ticks become stale after `MARKET_DATA_STALE_AFTER_SECONDS` (default 5). Sequence
-duplicates are ignored; out-of-order ticks cannot mutate candles. Any sequence
-gap is material by default. Reconnects begin a new feed epoch, and degraded data
-requires three consecutive in-order ticks by default before returning to
-trusted state. A candle touched by untrusted ticks remains untrusted.
+Ticks become stale after `MARKET_DATA_STALE_AFTER_SECONDS` (default 5). An exact
+same-token sequence/timestamp duplicate is ignored, while an older exchange
+timestamp cannot mutate candles. SmartAPI `sequence_number` is telemetry, not a
+per-token contiguous packet counter: one connection multiplexes instruments, so
+positive jumps do not imply packet loss, and a lower sequence alone does not
+prove reordering. Positive jumps are counted only as `sequence_jump_count`
+telemetry and never trigger recovery. There is therefore no configurable
+allowed-gap threshold. Trust instead depends on exchange timestamp freshness
+and ordering, reconnect epochs and recovery, ingestion/queue/writer integrity,
+and malformed-data rejection. Reconnects begin a new feed epoch, reset sequence
+telemetry, and require three consecutive valid fresh ticks by default before
+returning to trusted state. A candle touched by untrusted ticks remains
+untrusted.
 
 ## Candle and indicator definitions
 
@@ -392,7 +400,7 @@ any live automation.
 Phase 3 may add deterministic paper execution, fill simulation assumptions,
 position/risk state, protective exits, restart recovery, and kill-switch tests.
 It must not enable live orders. Phase 2 scanner output first needs validation
-across multiple recorded/replayed sessions, including feed gaps and cache refresh
-operations.
+across multiple recorded/replayed sessions, including reconnects, timestamp
+regressions, and cache refresh operations.
 
 See `AGENTS.md` for the full engineering and real-money safety contract.
