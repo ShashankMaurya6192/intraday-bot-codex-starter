@@ -24,6 +24,8 @@ There is no paper execution, order interface, or live order-placement code.
   suppresses scanner readiness.
 - A Historical API rate-limit response aborts the whole bootstrap immediately;
   it is never retried as a transient error and never advances to another symbol.
+- Angel may throttle the Historical API independently while normal login and
+  live WebSocket market data remain healthy.
 
 ## Windows 10/11 setup (PowerShell)
 
@@ -224,6 +226,11 @@ command: wait for Angel's Historical API access window to reset, then rerun it.
 Previously completed atomic writes remain valid, the throttled symbol retains
 any older valid dataset, and a normal rerun skips completed symbols before
 resuming.
+
+`record-scanner-market` remains usable while historical bootstrap is
+broker-throttled because its WebSocket path is independent. Until enough prior
+history is available, scanner EMA/ATR/RVOL warm-ups may remain incomplete and
+scanner readiness will continue to fail safe.
 
 The default range targets at least 15 complete prior sessions. Complete equity
 sessions create RVOL baselines; NIFTY never does. A rerun skips current
