@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     scanner_breakout_proximity_pct: Decimal = Field(
         default=Decimal("0.25"), ge=0, le=10
     )
+    max_vwap_distance_atr: Decimal = Field(default=Decimal("1.5"), gt=0)
     regime_momentum_threshold_pct: Decimal = Field(default=Decimal("0.05"), ge=0, le=10)
     regime_slope_lookback_candles: int = Field(default=3, ge=1, le=20)
     scanner_weight_vwap: Decimal = Field(default=Decimal("2"), ge=0)

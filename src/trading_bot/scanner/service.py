@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Protocol
@@ -38,6 +39,7 @@ from .models import (
     ScannerResult,
     ScannerWeights,
 )
+from .qualification import qualify_candidate
 
 
 class RelativeVolumeBaselineReader(Protocol):
@@ -64,6 +66,7 @@ class MarketScanner:
         breakout_proximity_pct: Decimal = Decimal("0.25"),
         regime_momentum_threshold_pct: Decimal = Decimal("0.05"),
         regime_slope_lookback_candles: int = 3,
+        max_vwap_distance_atr: Decimal = Decimal("1.5"),
     ) -> None:
         if relative_volume_lookback_sessions < relative_volume_minimum_sessions:
             raise ValueError("RVOL lookback cannot be shorter than its minimum")
@@ -77,6 +80,12 @@ class MarketScanner:
         self._breakout_proximity_pct = Decimal(str(breakout_proximity_pct))
         self._regime_momentum = Decimal(str(regime_momentum_threshold_pct))
         self._regime_slope = regime_slope_lookback_candles
+        self._max_vwap_distance_atr = Decimal(str(max_vwap_distance_atr))
+        if (
+            not self._max_vwap_distance_atr.is_finite()
+            or self._max_vwap_distance_atr <= 0
+        ):
+            raise ValueError("max_vwap_distance_atr must be positive and finite")
 
     def scan(
         self,
@@ -200,6 +209,12 @@ class MarketScanner:
                 CandleInterval.FIVE_MINUTES,
                 evaluation_at=now_ist,
             )
+            current_five_minute = _interval(
+                candles,
+                CandleInterval.FIVE_MINUTES,
+                session_date=now_ist.date(),
+                evaluation_at=now_ist,
+            )
             readiness = self._indicator_values(
                 instrument=instrument,
                 one_minute=one_minute,
@@ -225,10 +240,28 @@ class MarketScanner:
                 # per equity in deterministic output.
                 continue
             long_candidates.append(
-                self._candidate(CandidateBias.LONG, instrument, health, regime, values)
+                self._candidate(
+                    CandidateBias.LONG,
+                    instrument,
+                    health,
+                    regime,
+                    values,
+                    current_five_minute=current_five_minute,
+                    session_date=now_ist.date(),
+                    evaluation_at=now_ist,
+                )
             )
             short_candidates.append(
-                self._candidate(CandidateBias.SHORT, instrument, health, regime, values)
+                self._candidate(
+                    CandidateBias.SHORT,
+                    instrument,
+                    health,
+                    regime,
+                    values,
+                    current_five_minute=current_five_minute,
+                    session_date=now_ist.date(),
+                    evaluation_at=now_ist,
+                )
             )
 
         long_candidates.sort(key=lambda item: (-item.total_score, item.symbol))
@@ -442,6 +475,10 @@ class MarketScanner:
         health: InstrumentHealth,
         regime: MarketRegime,
         values: dict[str, Decimal],
+        *,
+        current_five_minute: Sequence[Candle],
+        session_date: date,
+        evaluation_at: datetime,
     ) -> ScannerCandidate:
         ltp = values["ltp"]
         breakout_distance = (values["opening_high"] - ltp) / ltp * Decimal(100)
@@ -490,7 +527,7 @@ class MarketScanner:
                 else Decimal(0)
             ),
         }
-        return ScannerCandidate(
+        candidate = ScannerCandidate(
             bias=bias,
             symbol=instrument.trading_symbol,
             symbol_token=instrument.symbol_token,
@@ -513,6 +550,20 @@ class MarketScanner:
             market_regime=regime,
             component_scores=component_scores,
             total_score=sum(component_scores.values(), Decimal(0)),
+        )
+        qualification = qualify_candidate(
+            candidate,
+            current_session_five_minute=current_five_minute,
+            session_date=session_date,
+            evaluation_at=evaluation_at,
+            opening_range_minutes=self._opening_range_minutes,
+            relative_volume_threshold=self._rvol_threshold,
+            max_vwap_distance_atr=self._max_vwap_distance_atr,
+        )
+        return replace(
+            candidate,
+            qualified=qualification.qualified,
+            qualification_reasons=qualification.reasons,
         )
 
 

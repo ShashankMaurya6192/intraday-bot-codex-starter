@@ -354,6 +354,9 @@ def test_scanner_exact_score_and_deterministic_tie_breaking() -> None:
     assert result.readiness is ScannerReadiness.READY
     assert [item.symbol for item in result.long_candidates] == ["ABC-EQ", "XYZ-EQ"]
     assert result.long_candidates[0].total_score == Decimal("10")
+    assert result.long_candidates[0].qualified
+    assert result.qualified_long_signals == result.long_candidates
+    assert result.qualified_short_signals == ()
     assert result.long_candidates[0].component_scores == {
         "vwap": Decimal("2"),
         "ema": Decimal("2"),
@@ -373,6 +376,58 @@ def test_scanner_exact_score_and_deterministic_tie_breaking() -> None:
             now=BASE + timedelta(minutes=20),
         ).to_dict()
     )
+
+
+def test_scanner_keeps_high_ranked_long_when_downtrend_disqualifies_it() -> None:
+    first, _, benchmark, candles, health = _scanner_fixture()
+    benchmark_key = (Exchange.NSE_CM, "999")
+    benchmark_one = [
+        candle
+        for candle in candles[benchmark_key]
+        if candle.interval is CandleInterval.ONE_MINUTE
+    ]
+    prior_base = BASE - timedelta(days=3)
+    benchmark_five = [
+        _candle(
+            index,
+            interval=CandleInterval.FIVE_MINUTES,
+            start_price=Decimal("104"),
+            step=Decimal("-0.1"),
+            token="999",
+            symbol="NIFTY",
+            base=prior_base,
+        )
+        for index in range(20)
+    ] + [
+        _candle(
+            index,
+            interval=CandleInterval.FIVE_MINUTES,
+            start_price=Decimal("101"),
+            step=Decimal("-0.1"),
+            token="999",
+            symbol="NIFTY",
+        )
+        for index in range(4)
+    ]
+    downtrend_candles = dict(candles)
+    downtrend_candles[benchmark_key] = benchmark_one + benchmark_five
+
+    result = MarketScanner().scan(
+        instruments=(first,),
+        candles_by_instrument=downtrend_candles,
+        health_by_instrument=health,
+        benchmark=benchmark,
+        baseline_store=FixedBaseline(),
+        now=BASE + timedelta(minutes=20),
+    )
+
+    assert result.market_regime is MarketRegime.TREND_DOWN
+    assert result.long_candidates[0].total_score == Decimal("9")
+    assert not result.long_candidates[0].qualified
+    assert result.long_candidates[0].qualification_reasons == (
+        "market_regime_not_trend_up",
+    )
+    assert result.qualified_long_signals == ()
 
 
 def test_scanner_suppresses_stale_data_and_unknown_regime() -> None:

@@ -70,6 +70,8 @@ class ScannerCandidate:
     component_scores: Mapping[str, Decimal] = field(default_factory=dict)
     total_score: Decimal = Decimal(0)
     rejection_reasons: tuple[str, ...] = ()
+    qualified: bool = False
+    qualification_reasons: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -98,6 +100,8 @@ class ScannerCandidate:
             },
             "total_score": str(self.total_score),
             "rejection_reasons": list(self.rejection_reasons),
+            "qualified": self.qualified,
+            "qualification_reasons": list(self.qualification_reasons),
         }
 
 
@@ -157,12 +161,28 @@ class ScannerResult:
     replay_elapsed_seconds: float
     diagnostics: ScannerDiagnostics
 
+    @property
+    def qualified_long_signals(self) -> tuple[ScannerCandidate, ...]:
+        return tuple(item for item in self.long_candidates if item.qualified)
+
+    @property
+    def qualified_short_signals(self) -> tuple[ScannerCandidate, ...]:
+        return tuple(item for item in self.short_candidates if item.qualified)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "readiness": self.readiness.value,
             "market_regime": self.market_regime.value,
             "long_candidates": [item.to_dict() for item in self.long_candidates],
             "short_candidates": [item.to_dict() for item in self.short_candidates],
+            "qualified_long_signals": [
+                item.to_dict() for item in self.qualified_long_signals
+            ],
+            "qualified_short_signals": [
+                item.to_dict() for item in self.qualified_short_signals
+            ],
+            "qualified_long_count": len(self.qualified_long_signals),
+            "qualified_short_count": len(self.qualified_short_signals),
             "evaluated_count": self.evaluated_count,
             "rejected_count": self.rejected_count,
             "unhealthy_count": self.unhealthy_count,
@@ -177,3 +197,13 @@ class ScannerResult:
             "diagnostics": self.diagnostics.to_dict(),
             "analysis_only": True,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SignalQualification:
+    qualified: bool
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.qualified == bool(self.reasons):
+            raise ValueError("qualified must be true exactly when reasons are empty")

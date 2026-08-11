@@ -122,13 +122,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.3")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.4")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
         print(f"Database={settings.database_url}")
         print(f"Historical provider={settings.historical_provider.value}")
         print(f"Historical fallback enabled={settings.historical_fallback_enabled}")
+        print(f"Maximum VWAP distance ATR={settings.max_vwap_distance_atr}")
         print("Scanner output=ANALYSIS_ONLY")
         print("Paper execution available=False")
         print("Order placement available=False")
@@ -577,6 +578,10 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             "analysis_only": True,
             "long_candidates": [],
             "short_candidates": [],
+            "qualified_long_signals": [],
+            "qualified_short_signals": [],
+            "qualified_long_count": 0,
+            "qualified_short_count": 0,
             "requested_count": 0,
             "eligible_count": 0,
             "expected_ineligible_count": 0,
@@ -620,6 +625,10 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
                 "analysis_only": True,
                 "long_candidates": [],
                 "short_candidates": [],
+                "qualified_long_signals": [],
+                "qualified_short_signals": [],
+                "qualified_long_count": 0,
+                "qualified_short_count": 0,
                 "requested_count": len(settings.configured_scanner_symbols())
                 or len(nifty_cache.constituents),
                 "eligible_count": len(universe.instruments),
@@ -689,6 +698,7 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             breakout_proximity_pct=settings.scanner_breakout_proximity_pct,
             regime_momentum_threshold_pct=(settings.regime_momentum_threshold_pct),
             regime_slope_lookback_candles=(settings.regime_slope_lookback_candles),
+            max_vwap_distance_atr=settings.max_vwap_distance_atr,
         )
         scaling_warnings: list[str] = []
         if replay.raw_ticks_replayed > settings.scan_replay_warning_tick_count:
@@ -743,6 +753,12 @@ def _print_scan_payload(
         limited = dict(payload)
         limited["long_candidates"] = list(payload.get("long_candidates", []))[:limit]
         limited["short_candidates"] = list(payload.get("short_candidates", []))[:limit]
+        limited["qualified_long_signals"] = list(
+            payload.get("qualified_long_signals", [])
+        )[:limit]
+        limited["qualified_short_signals"] = list(
+            payload.get("qualified_short_signals", [])
+        )[:limit]
         print(json.dumps(limited, indent=2, sort_keys=True))
         return
     print(
@@ -754,15 +770,18 @@ def _print_scan_payload(
         f"eligible={payload.get('eligible_count', 0)} "
         f"expected_ineligible={payload.get('expected_ineligible_count', 0)} "
         f"mapping_failures={payload.get('mapping_failure_count', 0)} "
+        f"qualified_long={payload.get('qualified_long_count', 0)} "
+        f"qualified_short={payload.get('qualified_short_count', 0)} "
         f"raw_ticks_replayed={payload.get('raw_ticks_replayed', 0)} "
         f"replay_elapsed_seconds={payload.get('replay_elapsed_seconds', 0.0)}"
     )
-    print("BIAS  SYMBOL              SCORE      LTP     RVOL       RS")
+    print("BIAS  SYMBOL              SCORE QUAL      LTP     RVOL       RS")
     for bias_key in ("long_candidates", "short_candidates"):
         for item in list(payload.get(bias_key, []))[:limit]:
             print(
                 f"{item['bias']:<5} {item['symbol']:<19} "
-                f"{item['total_score']:>5} {item['ltp']:>8} "
+                f"{item['total_score']:>5} "
+                f"{str(item.get('qualified', False)):<5} {item['ltp']:>8} "
                 f"{item['relative_volume']:>8} {item['relative_strength']:>8}"
             )
     raw_diagnostics = payload.get("diagnostics", {})

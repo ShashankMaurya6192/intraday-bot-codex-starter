@@ -3,10 +3,10 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.3 adds causal same-day recovery from trusted SmartAPI session fields and
-an explicit PAPER-only yfinance fallback for research history. It builds on the
-Phase 2.2 fail-safe Historical API throttling and Phase 2.1 market-intelligence
-correctness gates. Scanner results are analysis only.
+Phase 2.4 preserves deterministic candidate ranking and adds a strict,
+machine-readable signal-qualification gate. It builds on Phase 2.3 causal
+same-day recovery and the explicit PAPER-only research-history fallback.
+Scanner results and qualified signals remain analysis only.
 There is no paper execution, order interface, or live order-placement code.
 
 ## Safety status
@@ -178,6 +178,12 @@ python -m trading_bot scan --limit 20
 python -m trading_bot scan --json --limit 20
 ```
 
+The ranked candidate lists are preserved even when a candidate is unqualified.
+Human output includes qualification counts and a `QUAL` column. JSON includes
+`qualified`, ordered `qualification_reasons`, `qualified_long_signals`,
+`qualified_short_signals`, and their counts. These are analytical gates only;
+there is still no execution consumer.
+
 Bootstrap prior research history explicitly before expecting early-session
 EMA/ATR/RVOL readiness. This command never runs from `record-market`,
 `record-scanner-market`, or `scan`:
@@ -290,7 +296,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.3 architecture
+## Phase 2.4 architecture
 
 ```text
 explicit refresh commands
@@ -308,6 +314,7 @@ recorded SmartAPI ticks
   -> idempotent SQLite candles + complete-session RVOL baselines
   -> replay-safe indicators + NIFTY regime
   -> explainable analysis-only scanner rankings
+  -> strict analysis-only signal qualification
 ```
 
 - `trading_bot.reference_data`: atomic cache metadata, bounded verified-HTTPS
@@ -426,6 +433,47 @@ strength, opening range/distances, a sector placeholder, regime, component
 scores, total score, and diagnostics. It contains no quantity, executable entry,
 fill, or order instruction.
 
+## Signal qualification
+
+Qualification is separate from ranking. A high-scoring candidate remains in its
+ranked LONG/SHORT list when one or more strict gates fail.
+
+A LONG qualification requires all of:
+
+- instrument market data is `READY`;
+- regime is `TREND_UP`;
+- LTP is strictly above VWAP;
+- EMA9 is strictly above EMA20 on completed five-minute data;
+- RVOL is at least `RELATIVE_VOLUME_THRESHOLD` (default `1.5`);
+- relative strength versus NIFTY is strictly positive;
+- a trusted, completed current-session five-minute candle ending after the
+  opening-range boundary closes strictly above opening-range high;
+- absolute VWAP distance is at most `MAX_VWAP_DISTANCE_ATR` (default `1.5`);
+- every required indicator/reference is available.
+
+A SHORT qualification uses the exact directional inverse: `TREND_DOWN`, LTP
+strictly below VWAP, EMA9 strictly below EMA20, negative relative strength, and
+a trusted completed five-minute close strictly below opening-range low. The same
+RVOL and absolute VWAP/ATR-extension limits apply. Equality passes the RVOL and
+extension limits but fails price, EMA, relative-strength, and breakout direction
+checks.
+
+Opening-range proximity remains only a ranking component. Tick touches,
+intrabar high/low spikes, partial candles, untrusted candles, candles from prior
+sessions, and candles whose `end_at` is after the replay cutoff never confirm a
+breakout. With the default 15-minute range, the 09:25-09:30 candle does not
+qualify because it finishes at—not after—the 09:30 boundary; the first possible
+confirmation is the completed 09:30-09:35 candle.
+
+Qualification reasons are emitted in stable gate order, including
+`market_regime_not_trend_up`, `market_regime_not_trend_down`,
+`price_not_above_vwap`, `price_not_below_vwap`,
+`ema9_not_above_ema20`, `ema9_not_below_ema20`, `rvol_below_threshold`,
+`relative_strength_not_positive`, `relative_strength_not_negative`,
+`opening_breakout_not_confirmed`, `opening_breakdown_not_confirmed`, and
+`vwap_atr_extension_exceeded`. Sector remains `None`; sector confirmation is a
+future enhancement until authoritative sector/index mapping is implemented.
+
 ## TLS, reconnect, and ingestion guarantees
 
 The project pins `smartapi-python==1.5.5`. That SDK's WebSocket `connect()` uses
@@ -451,7 +499,7 @@ credential-free pytest suite.
 Each as-of scan first counts raw ticks without loading them, rejects a count over
 `SCAN_REPLAY_HARD_TICK_LIMIT`, and reports raw ticks replayed plus replay elapsed
 time. Configurable tick/runtime warnings make current replay cost visible. This
-bounded replay remains a Phase 2.3 bridge: an incremental live intelligence
+bounded replay remains a Phase 2.4 bridge: an incremental live intelligence
 worker with persisted health/candle snapshots is the next scaling step before
 any live automation.
 
