@@ -103,6 +103,33 @@ class ProjectionCutoffBehindCheckpointError(ProjectionError):
     """A requested as-of view predates already-materialized engine state."""
 
 
+class ProjectionCatchUpPendingError(ProjectionError):
+    """Authoritative raw rows are ahead of the recorder-owned projection."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint_tick_id: int,
+        raw_tick_id: int,
+        checkpoint_feed_event_id: int,
+        raw_feed_event_id: int,
+    ) -> None:
+        self.checkpoint_tick_id = checkpoint_tick_id
+        self.raw_tick_id = raw_tick_id
+        self.checkpoint_feed_event_id = checkpoint_feed_event_id
+        self.raw_feed_event_id = raw_feed_event_id
+        super().__init__(
+            "projection_catch_up_pending: recorder projection is behind "
+            "authoritative raw storage "
+            f"(ticks={checkpoint_tick_id}->{raw_tick_id}, "
+            f"feed_events={checkpoint_feed_event_id}->{raw_feed_event_id})"
+        )
+
+
+class ProjectionConcurrentAdvanceError(ProjectionError):
+    """Another writer changed the projection after this engine restored it."""
+
+
 class ProjectionStore(Protocol):
     def load_projection_checkpoint(
         self, session_date: date
@@ -142,6 +169,7 @@ class ProjectionStore(Protocol):
     def save_projection_state(
         self,
         *,
+        expected_checkpoint: ProjectionCheckpoint | None,
         checkpoint: ProjectionCheckpoint,
         health: Sequence[InstrumentHealth],
         latest_references: Sequence[SessionReference],
@@ -170,6 +198,7 @@ class MarketIntelligenceProjection:
         self._recovery_ticks = recovery_consecutive_ticks
         self._reset_engine()
         self._checkpoint: ProjectionCheckpoint | None = None
+        self._persisted_checkpoint: ProjectionCheckpoint | None = None
         self._last_update = ProjectionUpdate(0, 0, False, None)
 
     @property
@@ -226,6 +255,7 @@ class MarketIntelligenceProjection:
                 )
             return self._rebuild(evaluation, reason="feed_epoch_mismatch")
         self._checkpoint = checkpoint
+        self._persisted_checkpoint = checkpoint
         update = self.catch_up(now=evaluation, tick_limit=catch_up_tick_limit)
         self._last_update = update
         return update
@@ -332,6 +362,7 @@ class MarketIntelligenceProjection:
         self._store.clear_projection_session(self._session_date)
         self._reset_engine()
         self._checkpoint = self._new_checkpoint(now)
+        self._persisted_checkpoint = None
         ticks = self._store.load_tick_records_after(
             self._session_date,
             after_id=0,
@@ -421,6 +452,8 @@ class MarketIntelligenceProjection:
 
     def _materialize(self, now: datetime) -> None:
         evaluation = _aware(now)
+        checkpoint = self._require_checkpoint()
+        evaluation = _health_evaluation_at(checkpoint, evaluation)
         session_open, session_end = _session_bounds(self._session_date)
         if evaluation >= session_open:
             self._pending_candles.extend(
@@ -459,8 +492,7 @@ class MarketIntelligenceProjection:
         )
         self._pending_candles.clear()
         checkpoint = self._require_checkpoint()
-        health_now = _health_evaluation_at(checkpoint, evaluation)
-        health = self._monitor.all_health(now=health_now)
+        health = self._monitor.all_health(now=evaluation)
         saved = ProjectionCheckpoint(
             session_date=self._session_date,
             last_tick_id=checkpoint.last_tick_id,
@@ -473,6 +505,7 @@ class MarketIntelligenceProjection:
             engine_state=self._engine_state(),
         )
         self._store.save_projection_state(
+            expected_checkpoint=self._persisted_checkpoint,
             checkpoint=saved,
             health=health,
             latest_references=tuple(self._references.latest.values()),
@@ -485,6 +518,7 @@ class MarketIntelligenceProjection:
             candles=changed_candles,
         )
         self._checkpoint = saved
+        self._persisted_checkpoint = saved
 
     def _validate_not_ahead(self, checkpoint: ProjectionCheckpoint) -> None:
         max_tick_id = self._store.max_tick_id(self._session_date)

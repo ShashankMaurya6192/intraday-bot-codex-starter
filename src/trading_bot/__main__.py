@@ -134,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.1")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -615,13 +615,11 @@ def _compare_projection_replay(
         if benchmark is not None and benchmark.instrument_type != "AMXIDX":
             benchmark = None
         with _recorder(settings) as recorder:
-            projection = _projection(settings, recorder, session_date)
-            projection.initialize(
-                now=evaluation_at,
-                allow_rebuild=False,
-                catch_up_tick_limit=settings.scan_replay_hard_tick_limit,
+            view = recorder.load_projection_view(
+                session_date,
+                now=now,
             )
-            view = projection.view(now=evaluation_at)
+            evaluation_at = view.checkpoint.updated_at
             replay = _replay_engine(settings).replay_date(
                 recorder,
                 session_date,
@@ -903,15 +901,7 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
     with _recorder(settings) as recorder:
         projection_started = perf_counter()
         try:
-            projection = _projection(settings, recorder, now.date())
-            update = projection.initialize(
-                now=now,
-                allow_rebuild=False,
-                catch_up_tick_limit=(
-                    settings.scanner_projection_catch_up_tick_limit
-                ),
-            )
-            view = projection.view(now=now)
+            view = recorder.load_projection_view(now.date(), now=now)
         except ProjectionError as exc:
             payload = _projection_not_ready_payload(
                 settings=settings,
@@ -924,6 +914,7 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             return 2
         projection_load_seconds = perf_counter() - projection_started
         projection_age = view.projection_age_seconds
+        evaluation_at = view.checkpoint.updated_at
         freshness_reason = _projection_freshness_reason(
             now=now,
             projection_age_seconds=projection_age,
@@ -939,36 +930,28 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
                 load_seconds=projection_load_seconds,
                 projection_age_seconds=projection_age,
                 last_tick_id=view.checkpoint.last_tick_id,
-                incremental_ticks_processed=update.incremental_ticks_processed,
             )
             _print_scan_payload(payload, json_output=json_output, limit=limit)
             return 2
         historical_start = datetime.combine(
-            now.date() - timedelta(days=settings.historical_bootstrap_lookback_days),
+            evaluation_at.date()
+            - timedelta(days=settings.historical_bootstrap_lookback_days),
             time.min,
             tzinfo=IST,
         )
-        persisted_candles = recorder.load_candles(
-            start_at=historical_start,
-            end_at=now,
+        session_start = datetime.combine(
+            evaluation_at.date(), time.min, tzinfo=IST
         )
-        candles_by_key: dict[tuple[Exchange, str], list[Candle]] = {}
-        for candle in persisted_candles:
-            key = (candle.exchange, candle.symbol_token)
-            candles_by_key.setdefault(key, []).append(candle)
-        candles_by = {
-            key: sorted(values, key=lambda item: (item.start_at, item.interval))
-            for key, values in candles_by_key.items()
-        }
+        prior_candles = recorder.load_candles(
+            start_at=historical_start,
+            end_at=session_start,
+        )
+        candles_by = _candles_by_instrument((*prior_candles, *view.candles))
         health_by = {
             (health.exchange, health.symbol_token): health for health in view.health
         }
         scanner = _market_scanner(settings)
         scaling_warnings: list[str] = []
-        if update.incremental_ticks_processed:
-            scaling_warnings.append(
-                f"projection_suffix_catch_up:{update.incremental_ticks_processed}"
-            )
         if projection_load_seconds > settings.scan_replay_warning_seconds:
             scaling_warnings.append(
                 "projection_load_runtime_warning_threshold_exceeded:"
@@ -981,7 +964,7 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             health_by_instrument=health_by,
             benchmark=benchmark,
             baseline_store=recorder,
-            now=now,
+            now=evaluation_at,
             expected_eligibility_diagnostics=[
                 f"{item.symbol}:{item.reason}"
                 for item in universe.expected_eligibility_exclusions
@@ -1007,7 +990,7 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
                 None if projection_age is None else round(projection_age, 6)
             ),
             projection_load_seconds=round(projection_load_seconds, 6),
-            incremental_ticks_processed=update.incremental_ticks_processed,
+            incremental_ticks_processed=0,
             full_replay_used=False,
             projection_last_tick_id=view.checkpoint.last_tick_id,
         )

@@ -30,7 +30,17 @@ from trading_bot.marketdata import (
     SessionReference,
 )
 from trading_bot.marketdata.history import HistoricalBootstrapStatus
-from trading_bot.marketdata.projection import ProjectionCheckpoint
+from trading_bot.marketdata.projection import (
+    ProjectionCatchUpPendingError,
+    ProjectionCheckpoint,
+    ProjectionCheckpointAheadError,
+    ProjectionConcurrentAdvanceError,
+    ProjectionCutoffBehindCheckpointError,
+    ProjectionStateCorruptError,
+    ProjectionUnavailableError,
+    ProjectionView,
+)
+from trading_bot.marketdata.recovery import opening_references_visible
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -820,20 +830,7 @@ class SQLiteMarketRecorder:
             ).fetchone()
         if row is None:
             return None
-        engine_state = json.loads(row["state_json"])
-        if not isinstance(engine_state, dict):
-            raise ValueError("projection state_json must contain an object")
-        return ProjectionCheckpoint(
-            session_date=date.fromisoformat(row["session_date"]),
-            last_tick_id=int(row["last_tick_id"]),
-            last_feed_event_id=int(row["last_feed_event_id"]),
-            last_received_at=_optional_datetime(row["last_received_at"]),
-            last_feed_event_at=_optional_datetime(row["last_feed_event_at"]),
-            feed_epoch=int(row["feed_epoch"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-            state_version=int(row["state_version"]),
-            engine_state=engine_state,
-        )
+        return _row_to_projection_checkpoint(row)
 
     def load_projection_health(self, session_date: date) -> list[InstrumentHealth]:
         with self._lock:
@@ -845,37 +842,7 @@ class SQLiteMarketRecorder:
                 """,
                 (session_date.isoformat(),),
             ).fetchall()
-        return [
-            InstrumentHealth(
-                exchange=Exchange(row["exchange"]),
-                symbol_token=row["symbol_token"],
-                feed_epoch=int(row["feed_epoch"]),
-                status=MarketDataHealthStatus(row["status"]),
-                latest_exchange_timestamp=_optional_datetime(
-                    row["latest_exchange_timestamp"]
-                ),
-                latest_received_timestamp=_optional_datetime(
-                    row["latest_received_timestamp"]
-                ),
-                sequence_number=(
-                    None
-                    if row["sequence_number"] is None
-                    else int(row["sequence_number"])
-                ),
-                data_age_seconds=(
-                    None
-                    if row["data_age_seconds"] is None
-                    else float(row["data_age_seconds"])
-                ),
-                duplicate_count=int(row["duplicate_count"]),
-                out_of_order_count=int(row["out_of_order_count"]),
-                sequence_jump_count=int(row["sequence_jump_count"]),
-                last_health_transition=datetime.fromisoformat(
-                    row["last_health_transition"]
-                ),
-            )
-            for row in rows
-        ]
+        return [_row_to_instrument_health(row) for row in rows]
 
     def load_projection_references(
         self, session_date: date, *, reference_kind: str
@@ -897,9 +864,156 @@ class SQLiteMarketRecorder:
             ).fetchall()
         return [_row_to_session_reference(row) for row in rows]
 
+    def load_projection_view(
+        self, session_date: date, *, now: datetime
+    ) -> ProjectionView:
+        """Load one read-only, transactionally consistent projection commit."""
+        evaluation = datetime.fromisoformat(_aware_iso(now))
+        session_text = session_date.isoformat()
+        start_at, end_at = _session_iso_bounds(session_date)
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN")
+                checkpoint_row = self._connection.execute(
+                    """
+                    SELECT * FROM market_projection_checkpoint
+                    WHERE session_date = ?
+                    """,
+                    (session_text,),
+                ).fetchone()
+                health_rows = self._connection.execute(
+                    """
+                    SELECT * FROM market_health_snapshot
+                    WHERE session_date = ?
+                    ORDER BY exchange, symbol_token
+                    """,
+                    (session_text,),
+                ).fetchall()
+                reference_rows = self._connection.execute(
+                    """
+                    SELECT * FROM market_session_reference
+                    WHERE session_date = ?
+                    ORDER BY reference_kind, exchange, symbol_token
+                    """,
+                    (session_text,),
+                ).fetchall()
+                candle_rows = self._connection.execute(
+                    """
+                    SELECT * FROM market_candles
+                    WHERE start_at >= ? AND start_at < ?
+                    ORDER BY exchange, symbol_token, start_at, interval_minutes
+                    """,
+                    (start_at, end_at),
+                ).fetchall()
+                tick_row = self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(id), 0) AS max_id
+                    FROM market_ticks
+                    WHERE exchange_timestamp >= ? AND exchange_timestamp < ?
+                    """,
+                    (start_at, end_at),
+                ).fetchone()
+                event_row = self._connection.execute(
+                    """
+                    SELECT COALESCE(MAX(id), 0) AS max_id
+                    FROM market_feed_events
+                    WHERE occurred_at >= ? AND occurred_at < ?
+                    """,
+                    (start_at, end_at),
+                ).fetchone()
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
+        if checkpoint_row is None:
+            raise ProjectionUnavailableError("projection checkpoint is missing")
+        try:
+            checkpoint = _row_to_projection_checkpoint(checkpoint_row)
+            health = tuple(_row_to_instrument_health(row) for row in health_rows)
+            references = tuple(
+                (str(row["reference_kind"]), _row_to_session_reference(row))
+                for row in reference_rows
+            )
+            candles = tuple(_row_to_candle(row) for row in candle_rows)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProjectionStateCorruptError(
+                "materialized projection snapshot is corrupt"
+            ) from exc
+        if checkpoint.session_date != session_date:
+            raise ProjectionStateCorruptError(
+                "projection checkpoint session date is inconsistent"
+            )
+        if any(
+            timestamp is not None and timestamp > evaluation
+            for timestamp in (
+                checkpoint.updated_at,
+                checkpoint.last_received_at,
+                checkpoint.last_feed_event_at,
+            )
+        ):
+            raise ProjectionCutoffBehindCheckpointError(
+                "projection checkpoint is ahead of the requested read time"
+            )
+        raw_tick_id = int(tick_row["max_id"])
+        raw_event_id = int(event_row["max_id"])
+        if (
+            checkpoint.last_tick_id > raw_tick_id
+            or checkpoint.last_feed_event_id > raw_event_id
+        ):
+            raise ProjectionCheckpointAheadError(
+                "projection checkpoint is ahead of authoritative raw storage"
+            )
+        if (
+            checkpoint.last_tick_id < raw_tick_id
+            or checkpoint.last_feed_event_id < raw_event_id
+        ):
+            raise ProjectionCatchUpPendingError(
+                checkpoint_tick_id=checkpoint.last_tick_id,
+                raw_tick_id=raw_tick_id,
+                checkpoint_feed_event_id=checkpoint.last_feed_event_id,
+                raw_feed_event_id=raw_event_id,
+            )
+        if any(item.feed_epoch > checkpoint.feed_epoch for item in health):
+            raise ProjectionStateCorruptError(
+                "projection health is ahead of the checkpoint feed epoch"
+            )
+
+        latest = tuple(
+            item for kind, item in references if kind == "LATEST"
+        )
+        opening = tuple(
+            item
+            for kind, item in references
+            if kind == "BEFORE_OPENING_RANGE"
+        )
+        projection_age = None
+        if checkpoint.last_received_at is not None:
+            projection_age = max(
+                0.0,
+                (evaluation - checkpoint.last_received_at).total_seconds(),
+            )
+        return ProjectionView(
+            checkpoint=checkpoint,
+            candles=candles,
+            health=health,
+            session_references=latest,
+            opening_range_references=opening_references_visible(
+                {
+                    (item.exchange, item.symbol_token): item
+                    for item in opening
+                },
+                evaluation_at=checkpoint.updated_at,
+            ),
+            projection_age_seconds=projection_age,
+            incremental_ticks_processed=0,
+            rebuilt=False,
+        )
+
     def save_projection_state(
         self,
         *,
+        expected_checkpoint: ProjectionCheckpoint | None,
         checkpoint: ProjectionCheckpoint,
         health: Sequence[InstrumentHealth],
         latest_references: Sequence[SessionReference],
@@ -914,89 +1028,104 @@ class SQLiteMarketRecorder:
             ("BEFORE_FIRST_FIVE", first_five_references),
             ("BEFORE_OPENING_RANGE", opening_range_references),
         )
-        with self._lock, self._connection:
-            existing = self._connection.execute(
-                """
-                SELECT last_tick_id, last_feed_event_id
-                FROM market_projection_checkpoint
-                WHERE session_date = ?
-                """,
-                (session_text,),
-            ).fetchone()
-            if existing is not None and (
-                int(existing["last_tick_id"]) > checkpoint.last_tick_id
-                or int(existing["last_feed_event_id"])
-                > checkpoint.last_feed_event_id
-            ):
-                raise ValueError("projection checkpoint cursor cannot move backward")
-            for candle in candles:
-                self._connection.execute(_INSERT_CANDLE, _candle_values(candle))
-            self._connection.execute(
-                "DELETE FROM market_health_snapshot WHERE session_date = ?",
-                (session_text,),
+        if expected_checkpoint is not None and (
+            checkpoint.last_tick_id < expected_checkpoint.last_tick_id
+            or checkpoint.last_feed_event_id
+            < expected_checkpoint.last_feed_event_id
+            or checkpoint.updated_at < expected_checkpoint.updated_at
+        ):
+            raise ProjectionStateCorruptError(
+                "projection checkpoint cannot move backward from its predecessor"
             )
-            self._connection.executemany(
-                """
-                INSERT INTO market_health_snapshot(
-                    session_date, exchange, symbol_token, feed_epoch, status,
-                    latest_exchange_timestamp, latest_received_timestamp,
-                    sequence_number, data_age_seconds, duplicate_count,
-                    out_of_order_count, sequence_jump_count,
-                    last_health_transition
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [_health_values(checkpoint.session_date, item) for item in health],
-            )
-            self._connection.execute(
-                "DELETE FROM market_session_reference WHERE session_date = ?",
-                (session_text,),
-            )
-            reference_rows = [
-                _session_reference_values(kind, item)
-                for kind, references in reference_groups
-                for item in references
-            ]
-            if reference_rows:
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._connection.execute(
+                    """
+                    SELECT * FROM market_projection_checkpoint
+                    WHERE session_date = ?
+                    """,
+                    (session_text,),
+                ).fetchone()
+                if not _checkpoint_matches(existing, expected_checkpoint):
+                    raise ProjectionConcurrentAdvanceError(
+                        "projection changed after the writer restored its predecessor"
+                    )
+                for candle in candles:
+                    self._connection.execute(_INSERT_CANDLE, _candle_values(candle))
+                self._connection.execute(
+                    "DELETE FROM market_health_snapshot WHERE session_date = ?",
+                    (session_text,),
+                )
                 self._connection.executemany(
                     """
-                    INSERT INTO market_session_reference(
-                        session_date, reference_kind, exchange, symbol_token,
-                        trading_symbol, observed_at, session_open, session_high,
-                        session_low, last_traded_price, average_traded_price,
-                        cumulative_volume, provenance, trusted
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO market_health_snapshot(
+                        session_date, exchange, symbol_token, feed_epoch, status,
+                        latest_exchange_timestamp, latest_received_timestamp,
+                        sequence_number, data_age_seconds, duplicate_count,
+                        out_of_order_count, sequence_jump_count,
+                        last_health_transition
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    reference_rows,
+                    [
+                        _health_values(checkpoint.session_date, item)
+                        for item in health
+                    ],
                 )
-            self._connection.execute(
-                """
-                INSERT INTO market_projection_checkpoint(
-                    session_date, last_tick_id, last_feed_event_id,
-                    last_received_at, last_feed_event_at, feed_epoch, updated_at,
-                    state_version, state_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_date) DO UPDATE SET
-                    last_tick_id = excluded.last_tick_id,
-                    last_feed_event_id = excluded.last_feed_event_id,
-                    last_received_at = excluded.last_received_at,
-                    last_feed_event_at = excluded.last_feed_event_at,
-                    feed_epoch = excluded.feed_epoch,
-                    updated_at = excluded.updated_at,
-                    state_version = excluded.state_version,
-                    state_json = excluded.state_json
-                """,
-                (
-                    session_text,
-                    checkpoint.last_tick_id,
-                    checkpoint.last_feed_event_id,
-                    _optional_datetime_iso(checkpoint.last_received_at),
-                    _optional_datetime_iso(checkpoint.last_feed_event_at),
-                    checkpoint.feed_epoch,
-                    checkpoint.updated_at.isoformat(),
-                    checkpoint.state_version,
-                    _json(checkpoint.engine_state),
-                ),
-            )
+                self._connection.execute(
+                    "DELETE FROM market_session_reference WHERE session_date = ?",
+                    (session_text,),
+                )
+                reference_rows = [
+                    _session_reference_values(kind, item)
+                    for kind, references in reference_groups
+                    for item in references
+                ]
+                if reference_rows:
+                    self._connection.executemany(
+                        """
+                        INSERT INTO market_session_reference(
+                            session_date, reference_kind, exchange, symbol_token,
+                            trading_symbol, observed_at, session_open, session_high,
+                            session_low, last_traded_price, average_traded_price,
+                            cumulative_volume, provenance, trusted
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        reference_rows,
+                    )
+                self._connection.execute(
+                    """
+                    INSERT INTO market_projection_checkpoint(
+                        session_date, last_tick_id, last_feed_event_id,
+                        last_received_at, last_feed_event_at, feed_epoch, updated_at,
+                        state_version, state_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_date) DO UPDATE SET
+                        last_tick_id = excluded.last_tick_id,
+                        last_feed_event_id = excluded.last_feed_event_id,
+                        last_received_at = excluded.last_received_at,
+                        last_feed_event_at = excluded.last_feed_event_at,
+                        feed_epoch = excluded.feed_epoch,
+                        updated_at = excluded.updated_at,
+                        state_version = excluded.state_version,
+                        state_json = excluded.state_json
+                    """,
+                    (
+                        session_text,
+                        checkpoint.last_tick_id,
+                        checkpoint.last_feed_event_id,
+                        _optional_datetime_iso(checkpoint.last_received_at),
+                        _optional_datetime_iso(checkpoint.last_feed_event_at),
+                        checkpoint.feed_epoch,
+                        checkpoint.updated_at.isoformat(),
+                        checkpoint.state_version,
+                        _json(checkpoint.engine_state),
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
 
     def clear_projection_session(self, session_date: date) -> None:
         """Discard derived state while preserving authoritative raw rows."""
@@ -1214,6 +1343,77 @@ def _row_to_candle(row: sqlite3.Row) -> Candle:
         completed=bool(row["completed"]),
         trusted=bool(row["trusted"]),
         provenance=MarketDataProvenance(row["provenance"]),
+    )
+
+
+def _row_to_projection_checkpoint(row: sqlite3.Row) -> ProjectionCheckpoint:
+    engine_state = json.loads(row["state_json"])
+    if not isinstance(engine_state, dict):
+        raise ValueError("projection state_json must contain an object")
+    return ProjectionCheckpoint(
+        session_date=date.fromisoformat(row["session_date"]),
+        last_tick_id=int(row["last_tick_id"]),
+        last_feed_event_id=int(row["last_feed_event_id"]),
+        last_received_at=_optional_datetime(row["last_received_at"]),
+        last_feed_event_at=_optional_datetime(row["last_feed_event_at"]),
+        feed_epoch=int(row["feed_epoch"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        state_version=int(row["state_version"]),
+        engine_state=engine_state,
+    )
+
+
+def _checkpoint_matches(
+    row: sqlite3.Row | None,
+    expected: ProjectionCheckpoint | None,
+) -> bool:
+    if row is None:
+        return expected is None
+    if expected is None:
+        return False
+    return (
+        row["session_date"] == expected.session_date.isoformat()
+        and int(row["last_tick_id"]) == expected.last_tick_id
+        and int(row["last_feed_event_id"]) == expected.last_feed_event_id
+        and row["last_received_at"]
+        == _optional_datetime_iso(expected.last_received_at)
+        and row["last_feed_event_at"]
+        == _optional_datetime_iso(expected.last_feed_event_at)
+        and int(row["feed_epoch"]) == expected.feed_epoch
+        and row["updated_at"] == expected.updated_at.isoformat()
+        and int(row["state_version"]) == expected.state_version
+        and row["state_json"] == _json(expected.engine_state)
+    )
+
+
+def _row_to_instrument_health(row: sqlite3.Row) -> InstrumentHealth:
+    return InstrumentHealth(
+        exchange=Exchange(row["exchange"]),
+        symbol_token=row["symbol_token"],
+        feed_epoch=int(row["feed_epoch"]),
+        status=MarketDataHealthStatus(row["status"]),
+        latest_exchange_timestamp=_optional_datetime(
+            row["latest_exchange_timestamp"]
+        ),
+        latest_received_timestamp=_optional_datetime(
+            row["latest_received_timestamp"]
+        ),
+        sequence_number=(
+            None
+            if row["sequence_number"] is None
+            else int(row["sequence_number"])
+        ),
+        data_age_seconds=(
+            None
+            if row["data_age_seconds"] is None
+            else float(row["data_age_seconds"])
+        ),
+        duplicate_count=int(row["duplicate_count"]),
+        out_of_order_count=int(row["out_of_order_count"]),
+        sequence_jump_count=int(row["sequence_jump_count"]),
+        last_health_transition=datetime.fromisoformat(
+            row["last_health_transition"]
+        ),
     )
 
 

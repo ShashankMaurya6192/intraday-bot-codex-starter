@@ -3,9 +3,10 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.5 materializes current-session health, candles, and recovery references
-incrementally while `record-scanner-market` runs. Normal scans read that
-checkpointed SQLite projection instead of replaying the full raw-tick day.
+Phase 2.5.1 materializes current-session health, candles, and recovery
+references incrementally while `record-scanner-market` runs. That recorder is
+the single normal projection writer. Normal scans read one transactionally
+consistent SQLite snapshot and never advance or refresh the checkpoint.
 Phase 2.4 ranking and qualification semantics remain unchanged, and scanner
 results and qualified signals remain analysis only.
 There is no paper execution, order interface, or live order-placement code.
@@ -181,11 +182,19 @@ python -m trading_bot compare-projection-replay --date 2026-08-11 --json
 ```
 
 Start or restart `record-scanner-market` after upgrading so it can build the
-current-session projection. On its first Phase 2.5 start, it deterministically
+current-session projection. On its first Phase 2.5.1 start, it deterministically
 rebuilds the projection once from today's retained raw ticks. Later restarts
 restore the checkpoint and read only raw ticks/feed events after its cursors.
 Normal `scan` never silently falls back to a full-day replay when the projection
 is unavailable or inconsistent.
+
+`scan` is a read-only projection consumer. It loads the checkpoint, health,
+references, and completed current-session candles in one SQLite read
+transaction. If authoritative raw ticks or feed events are ahead of that
+checkpoint, it returns `NOT_READY` with `projection_catch_up_pending`; leave or
+restart `record-scanner-market` so the recorder-owned projector can catch up.
+The scan process never performs an independent mutable suffix catch-up and
+never changes checkpoint cursors, `updated_at`, or `state_json`.
 
 The ranked candidate lists are preserved even when a candidate is unqualified.
 Human output includes qualification counts and a `QUAL` column. JSON includes
@@ -198,10 +207,8 @@ Normal JSON output also includes `state_source=INCREMENTAL_PROJECTION`,
 `projection_last_tick_id`, `incremental_ticks_processed`,
 `full_replay_used=false`, and `raw_ticks_replayed=0`. During the live NSE cash
 session, a missing projection or age above
-`SCANNER_PROJECTION_STALE_AFTER_SECONDS` (default `5`) fails closed. A bounded
-suffix catch-up may process at most
-`SCANNER_PROJECTION_CATCH_UP_TICK_LIMIT` ticks (default `10000`); a larger gap
-requires the scanner recorder to catch up and does not trigger full replay.
+`SCANNER_PROJECTION_STALE_AFTER_SECONDS` (default `5`) fails closed. Any raw-row
+lead requires the scanner recorder to catch up and does not trigger full replay.
 
 Bootstrap prior research history explicitly before expecting early-session
 EMA/ATR/RVOL readiness. This command never runs from `record-market`,
@@ -315,7 +322,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.5 architecture
+## Phase 2.5.1 architecture
 
 ```text
 explicit refresh commands
@@ -377,10 +384,25 @@ raw tick/event ID ahead of SQLite fails closed because it could indicate lost
 authoritative data. Current-session raw ticks remain retained for audit and the
 explicit `replay` command.
 
-The equivalence command compares projected and replayed health, sequence
+Projection commits use optimistic compare-and-swap inside an immediate SQLite
+write transaction. The writer may replace the materialized health/reference
+rows and checkpoint only when the persisted predecessor still exactly matches
+the checkpoint it restored. If another writer advanced first, the stale writer
+gets `ProjectionConcurrentAdvanceError`; it cannot rewind or overwrite the
+newer state. A scan encountering a projection conflict fails closed with a
+bounded diagnostic instead of exposing a raw SQLite/value traceback.
+
+Read-side consistency uses an explicit SQLite snapshot transaction. Checkpoint
+version N is returned with health, references, and completed current-session
+candles from that same commit, never mixed with version N+1. Projection age is
+measured without touching the checkpoint, so repeated scans cannot make stale
+state appear fresh.
+
+The read-only equivalence command compares projected and replayed health, sequence
 telemetry, completed OHLCV/trust/provenance, references, scanner
 readiness/regime, candidate indicators/scores, and qualification output at the
-same cutoff. It exits non-zero on any mismatch and emits only bounded category
+persisted checkpoint cutoff. It never materializes or catches up the live
+projection. It exits non-zero on any mismatch and emits only bounded category
 diagnostics:
 
 ```powershell
@@ -559,10 +581,11 @@ credential-free pytest suite.
 
 ## Phase 3 remains unimplemented
 
-Normal as-of scans load prior historical candles plus current projected state;
-they do not count or replay the full raw-tick day. The raw replay hard limit and
-timing fields remain for explicit `replay`/projection-comparison diagnostics and
-backward-compatible output. Phase 2.5 is still local SQLite architecture: large
+Normal as-of scans load prior historical candles plus one read-only current
+projection snapshot; they do not count or replay the full raw-tick day. The raw
+replay hard limit and timing fields remain for explicit
+`replay`/projection-comparison diagnostics and backward-compatible output.
+Phase 2.5.1 is still local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -25,7 +26,9 @@ from trading_bot.marketdata import (
     MarketDataProvenance,
     MarketIntelligenceProjection,
     MarketReplayEngine,
+    ProjectionCatchUpPendingError,
     ProjectionCheckpointAheadError,
+    ProjectionConcurrentAdvanceError,
     ProjectionStateCorruptError,
 )
 from trading_bot.scanner import MarketScanner
@@ -487,6 +490,133 @@ def test_projection_failure_leaves_raw_tick_for_restart_catch_up() -> None:
         assert recorder.load_projection_checkpoint(SESSION) is None
 
 
+def test_read_only_projection_view_performs_no_projection_write(monkeypatch) -> None:
+    with SQLiteMarketRecorder("sqlite:///:memory:") as recorder:
+        recorder.record_tick(_tick(0, second=1))
+        projection = _projection(recorder)
+        projection.initialize(now=OPEN + timedelta(seconds=2), allow_rebuild=True)
+        before = recorder.load_projection_checkpoint(SESSION)
+        assert before is not None
+
+        def unexpected_write(**_kwargs) -> None:
+            raise AssertionError("read-only projection load attempted a write")
+
+        monkeypatch.setattr(recorder, "save_projection_state", unexpected_write)
+        view = recorder.load_projection_view(
+            SESSION, now=OPEN + timedelta(seconds=3)
+        )
+        after = recorder.load_projection_checkpoint(SESSION)
+
+    assert view.checkpoint == before
+    assert after == before
+    assert after.updated_at == before.updated_at
+    assert after.last_tick_id == before.last_tick_id
+    assert after.engine_state == before.engine_state
+
+
+def test_read_only_projection_view_fails_when_recorder_catch_up_is_pending() -> None:
+    with SQLiteMarketRecorder("sqlite:///:memory:") as recorder:
+        recorder.record_tick(_tick(0, second=1))
+        projection = _projection(recorder)
+        projection.initialize(now=OPEN + timedelta(seconds=2), allow_rebuild=True)
+        recorder.record_tick(_tick(0, second=2))
+
+        with pytest.raises(
+            ProjectionCatchUpPendingError, match="projection_catch_up_pending"
+        ):
+            recorder.load_projection_view(
+                SESSION, now=OPEN + timedelta(seconds=3)
+            )
+
+
+def test_stale_projection_writer_cas_cannot_overwrite_newer_recorder(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'projection-race.db'}"
+    with (
+        SQLiteMarketRecorder(database_url) as first_recorder,
+        SQLiteMarketRecorder(database_url) as second_recorder,
+    ):
+        first_recorder.record_tick(_tick(0, second=1))
+        stale_projection = _projection(first_recorder)
+        stale_projection.initialize(
+            now=OPEN + timedelta(seconds=2), allow_rebuild=True
+        )
+
+        live_projection = _projection(second_recorder)
+        live_projection.initialize(
+            now=OPEN + timedelta(seconds=3), allow_rebuild=False
+        )
+        writer = ProjectionMarketDataWriter(second_recorder, live_projection)
+        writer.record_ticks((_tick(0, second=4),))
+        advanced = second_recorder.load_projection_checkpoint(SESSION)
+        assert advanced is not None and advanced.last_tick_id == 2
+
+        with pytest.raises(ProjectionConcurrentAdvanceError):
+            stale_projection.view(now=OPEN + timedelta(seconds=5))
+
+        preserved = second_recorder.load_projection_checkpoint(SESSION)
+
+    assert preserved == advanced
+
+
+def test_projection_snapshot_remains_commit_consistent_during_live_advances(
+    tmp_path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'projection-snapshot.db'}"
+    with (
+        SQLiteMarketRecorder(database_url) as writer_recorder,
+        SQLiteMarketRecorder(database_url) as reader_recorder,
+    ):
+        writer_recorder.record_tick(_tick(0, second=1, sequence=1))
+        projection = _projection(writer_recorder)
+        projection.initialize(
+            now=OPEN + timedelta(seconds=2), allow_rebuild=True
+        )
+        writer = ProjectionMarketDataWriter(writer_recorder, projection)
+
+        def advance() -> None:
+            for index in range(2, 150):
+                writer.record_ticks(
+                    (
+                        _tick(
+                            index // 60,
+                            second=index % 60,
+                            sequence=index,
+                        ),
+                    )
+                )
+
+        worker = threading.Thread(target=advance)
+        worker.start()
+        observed = 0
+        while worker.is_alive():
+            try:
+                view = reader_recorder.load_projection_view(
+                    SESSION, now=OPEN + timedelta(minutes=3)
+                )
+            except ProjectionCatchUpPendingError:
+                continue
+            observed += 1
+            health_state = view.checkpoint.engine_state["health"]
+            assert isinstance(health_state, dict)
+            states = health_state["states"]
+            assert isinstance(states, list)
+            assert view.health[0].sequence_number == states[0]["sequence"]
+            assert (
+                view.session_references[0].observed_at
+                == view.health[0].latest_exchange_timestamp
+            )
+        worker.join()
+        final = reader_recorder.load_projection_view(
+            SESSION, now=OPEN + timedelta(minutes=3)
+        )
+
+    assert observed > 0
+    assert final.checkpoint.last_tick_id == 149
+    assert final.health[0].sequence_number == 149
+
+
 def test_projection_freshness_gate_is_fail_closed_only_during_live_session() -> None:
     live_now = datetime(2026, 8, 10, 10, 0, tzinfo=IST)
     after_close = datetime(2026, 8, 10, 16, 0, tzinfo=IST)
@@ -558,9 +688,13 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
         def load_candles(self, **_kwargs):
             return []
 
+        def load_projection_view(self, _session_date, *, now):
+            return view
+
     checkpoint = SimpleNamespace(
         last_tick_id=77,
         last_received_at=current - timedelta(seconds=1),
+        updated_at=current - timedelta(milliseconds=500),
     )
     view = SimpleNamespace(
         checkpoint=checkpoint,
@@ -570,15 +704,6 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
         session_references=(),
         opening_range_references=(),
     )
-    update = SimpleNamespace(incremental_ticks_processed=0)
-
-    class Projection:
-        def initialize(self, **_kwargs):
-            return update
-
-        def view(self, **_kwargs):
-            return view
-
     captured: dict[str, object] = {}
 
     class Result:
@@ -629,7 +754,11 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
     )
     monkeypatch.setattr(cli, "_recorder", lambda _settings: Recorder())
     monkeypatch.setattr(
-        cli, "_projection", lambda *_args, **_kwargs: Projection()
+        cli,
+        "_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("normal scan must not construct a mutable projection")
+        ),
     )
     monkeypatch.setattr(cli, "_market_expected_live", lambda _now: False)
     monkeypatch.setattr(cli, "_market_scanner", lambda _settings: Scanner())
@@ -648,6 +777,114 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
     assert '"raw_ticks_replayed": 0' in payload
     assert '"full_replay_used": false' in payload
     assert '"projection_last_tick_id": 77' in payload
+
+
+def test_scan_fails_closed_on_projection_concurrency_conflict(
+    monkeypatch, capsys
+) -> None:
+    settings = Settings(_env_file=None, database_url="sqlite:///:memory:")
+    universe = SimpleNamespace(
+        instruments=(),
+        expected_eligibility_exclusions=(),
+        mapping_failures=(),
+    )
+
+    class Cache:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def load(self, *, now):
+            return self.value
+
+    class Recorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def load_projection_view(self, _session_date, *, now):
+            raise ProjectionConcurrentAdvanceError("simulated recorder advance")
+
+    instrument_master = SimpleNamespace(find_trading_symbol=lambda *_args: None)
+    monkeypatch.setattr(
+        cli, "_instrument_cache", lambda _settings: Cache(instrument_master)
+    )
+    monkeypatch.setattr(cli, "_intraday_cache", lambda _settings: Cache(object()))
+    monkeypatch.setattr(
+        cli,
+        "_nifty500_cache",
+        lambda _settings: Cache(SimpleNamespace(constituents=("ABC",))),
+    )
+    monkeypatch.setattr(
+        cli, "resolve_nse_equity_universe", lambda *_args, **_kwargs: universe
+    )
+    monkeypatch.setattr(cli, "_recorder", lambda _settings: Recorder())
+
+    assert cli._scan(settings, json_output=True, limit=10) == 2
+    payload = capsys.readouterr().out
+
+    assert "ProjectionConcurrentAdvanceError" in payload
+    assert '"readiness": "NOT_READY"' in payload
+    assert '"full_replay_used": false' in payload
+
+
+def test_compare_projection_replay_does_not_mutate_checkpoint(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'projection-compare.db'}"
+    settings = Settings(_env_file=None, database_url=database_url)
+    with SQLiteMarketRecorder(database_url) as recorder:
+        recorder.record_tick(_tick(0, second=1))
+        projection = _projection(recorder)
+        projection.initialize(now=OPEN + timedelta(seconds=2), allow_rebuild=True)
+        before = recorder.load_projection_checkpoint(SESSION)
+    assert before is not None
+
+    class Cache:
+        def __init__(self, value) -> None:
+            self.value = value
+
+        def load(self, *, now):
+            return self.value
+
+    instrument_master = SimpleNamespace(find_trading_symbol=lambda *_args: None)
+    universe = SimpleNamespace(
+        instruments=(),
+        expected_eligibility_exclusions=(),
+        mapping_failures=(),
+    )
+    monkeypatch.setattr(
+        cli, "_instrument_cache", lambda _settings: Cache(instrument_master)
+    )
+    monkeypatch.setattr(cli, "_intraday_cache", lambda _settings: Cache(object()))
+    monkeypatch.setattr(
+        cli,
+        "_nifty500_cache",
+        lambda _settings: Cache(SimpleNamespace(constituents=())),
+    )
+    monkeypatch.setattr(
+        cli, "resolve_nse_equity_universe", lambda *_args, **_kwargs: universe
+    )
+    monkeypatch.setattr(
+        cli,
+        "_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("comparison must not construct a mutable projection")
+        ),
+    )
+
+    assert (
+        cli._compare_projection_replay(
+            settings, session_date=SESSION, json_output=True
+        )
+        == 0
+    )
+    capsys.readouterr()
+    with SQLiteMarketRecorder(database_url) as recorder:
+        after = recorder.load_projection_checkpoint(SESSION)
+
+    assert after == before
 
 
 def _health_semantics(items) -> tuple[tuple[object, ...], ...]:

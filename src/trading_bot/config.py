@@ -80,9 +80,6 @@ class Settings(BaseSettings):
     scanner_projection_stale_after_seconds: float = Field(
         default=5.0, gt=0, le=300
     )
-    scanner_projection_catch_up_tick_limit: int = Field(
-        default=10_000, ge=1, le=1_000_000
-    )
     market_data_recovery_consecutive_ticks: int = Field(default=3, ge=1, le=100)
     relative_volume_lookback_sessions: int = Field(default=15, ge=1, le=100)
     relative_volume_minimum_sessions: int = Field(default=10, ge=1, le=100)
