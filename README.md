@@ -3,7 +3,7 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.5.3 materializes current-session health, candles, and recovery
+Phase 2.5.4 materializes current-session health, candles, and recovery
 references incrementally while `record-scanner-market` runs. That recorder is
 the single normal projection writer. Normal scans read one transactionally
 consistent SQLite snapshot and never advance or refresh the checkpoint.
@@ -175,6 +175,23 @@ python -m trading_bot replay --date 2026-08-10
 python -m trading_bot replay --date 2026-08-10 --json
 ```
 
+Manual replay persistence follows a strict IST session-completion rule:
+
+- a date before the current IST date may be replayed and persisted;
+- the current IST date is rejected with non-zero status and
+  `reason=current_session_not_complete` before 15:30 IST;
+- at or after 15:30 IST, a current-date replay may persist only as a full replay
+  with no as-of cutoff, using the authoritative raw rows committed when the
+  command reads SQLite and the fixed 15:30 NSE cash-session close;
+- a future date is rejected with `future_session_not_complete`;
+- any replay with an explicit `evaluation_at` is analysis-only and never writes
+  candles or RVOL baselines, even if persistence was requested internally.
+
+Incomplete or untrusted one-minute coverage never replaces an RVOL baseline.
+Only a complete, trusted set covering all 375 regular-session minute offsets is
+eligible for baseline persistence. These replay rules do not modify the
+incremental scanner projection or its single-writer ownership.
+
 Scan current locally recorded data:
 
 ```powershell
@@ -335,7 +352,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.5.3 architecture
+## Phase 2.5.4 architecture
 
 ```text
 explicit refresh commands
@@ -346,6 +363,12 @@ explicit SmartAPI historical diagnostic/bootstrap
   -> default global abort, or explicit PAPER-only yfinance continuation
   -> validated complete 1m sessions
   -> provider/provenance status + local 5m/RVOL derivation
+
+manual raw replay
+  -> reject unfinished current/future IST sessions before any persistence
+  -> prior session or current date at/after fixed 15:30 close
+  -> full replay only for canonical candle persistence
+  -> complete/trusted 375-minute sessions only for RVOL baselines
 
 recorded SmartAPI ticks
   -> feed-epoch health monitor + sequence telemetry
@@ -625,7 +648,7 @@ Normal as-of scans load prior historical candles plus one read-only current
 projection snapshot; they do not count or replay the full raw-tick day. The raw
 replay hard limit and timing fields remain for explicit
 `replay`/projection-comparison diagnostics and backward-compatible output.
-Phase 2.5.3 is still local SQLite architecture: large
+Phase 2.5.4 is still local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 

@@ -25,6 +25,7 @@ from .marketdata import (
     ProjectionCutoffBehindCheckpointError,
     ProjectionError,
     ReplaySafetyLimitExceeded,
+    ReplaySessionNotCompleteError,
     YFinanceHistoricalProvider,
     run_historical_diagnostic,
 )
@@ -135,7 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.3")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.4")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -569,10 +570,38 @@ def _data_status(settings: Settings, *, json_output: bool) -> int:
 
 def _replay(settings: Settings, session_date: date, *, json_output: bool) -> int:
     engine = _replay_engine(settings)
-    with _recorder(settings) as recorder:
-        result = engine.replay_date(recorder, session_date, persist=True)
+    now = _ist_now()
+    try:
+        with _recorder(settings) as recorder:
+            result = engine.replay_date(
+                recorder,
+                session_date,
+                persist=True,
+                current_time=now,
+            )
+    except ReplaySessionNotCompleteError as exc:
+        payload = {
+            "date": session_date.isoformat(),
+            "status": "REJECTED",
+            "reason": exc.reason,
+            "session_close": exc.session_close.isoformat(),
+            "persisted": False,
+            "completion_rule": "prior_date_or_current_date_at_or_after_15:30_IST",
+            "order_placement_available": False,
+        }
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(
+                "Replay rejected: "
+                + " ".join(f"{key}={value}" for key, value in payload.items())
+            )
+        return 2
     payload = {
         "date": session_date.isoformat(),
+        "status": "COMPLETE",
+        "persisted": True,
+        "completion_rule": "prior_date_or_current_date_at_or_after_15:30_IST",
         "accepted_ticks": result.accepted_ticks,
         "rejected_ticks": result.rejected_ticks,
         "completed_candles": len(result.candles),
@@ -582,6 +611,7 @@ def _replay(settings: Settings, session_date: date, *, json_output: bool) -> int
         "ignored_future_ticks": result.ignored_future_ticks,
         "session_references": len(result.session_references),
         "opening_range_references": len(result.opening_range_references),
+        "order_placement_available": False,
     }
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))

@@ -42,7 +42,12 @@ from .projection import (
     ProjectionView,
 )
 from .regime import MarketRegime, classify_market_regime
-from .replay import MarketReplayEngine, ReplayResult, ReplaySafetyLimitExceeded
+from .replay import (
+    MarketReplayEngine,
+    ReplayResult,
+    ReplaySafetyLimitExceeded,
+    ReplaySessionNotCompleteError,
+)
 from .yfinance_history import (
     YFinanceDiagnosticResult,
     YFinanceHistoricalProvider,
@@ -85,6 +90,7 @@ __all__ = [
     "ProjectionView",
     "ReplayResult",
     "ReplaySafetyLimitExceeded",
+    "ReplaySessionNotCompleteError",
     "TickAssessment",
     "YFinanceDiagnosticResult",
     "YFinanceHistoricalProvider",

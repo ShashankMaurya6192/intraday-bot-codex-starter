@@ -9,7 +9,7 @@ from typing import Protocol
 
 from trading_bot.domain import IST, Exchange, FeedEvent, FeedEventType, MarketTick
 
-from .candles import SessionCandleAggregator
+from .candles import NSE_SESSION_CLOSE, SessionCandleAggregator
 from .health import MarketDataHealthMonitor
 from .models import Candle, CandleInterval, InstrumentHealth, SessionReference
 from .recovery import (
@@ -73,6 +73,29 @@ class ReplaySafetyLimitExceeded(RuntimeError):
         self.hard_limit = hard_limit
         super().__init__(
             f"replay tick count {tick_count} exceeds configured hard limit {hard_limit}"
+        )
+
+
+class ReplaySessionNotCompleteError(RuntimeError):
+    """Canonical replay persistence was requested before a session completed."""
+
+    def __init__(
+        self,
+        *,
+        session_date: date,
+        current_time: datetime,
+        reason: str,
+    ) -> None:
+        self.session_date = session_date
+        self.current_time = _aware(current_time)
+        self.session_close = datetime.combine(
+            session_date, NSE_SESSION_CLOSE, tzinfo=IST
+        )
+        self.reason = reason
+        super().__init__(
+            f"{reason}: replay persistence requires a completed IST session "
+            f"(date={session_date.isoformat()}, "
+            f"session_close={self.session_close.isoformat()})"
         )
 
 
@@ -197,10 +220,17 @@ class MarketReplayEngine:
         evaluation_at: datetime | None = None,
         persist: bool = True,
         hard_tick_limit: int | None = None,
+        current_time: datetime | None = None,
     ) -> ReplayResult:
         start_at = datetime.combine(session_date, time.min, tzinfo=IST)
         end_at = start_at + timedelta(days=1)
         cutoff = _aware(evaluation_at) if evaluation_at is not None else None
+        should_persist = persist and cutoff is None
+        if should_persist:
+            _require_completed_session_for_persistence(
+                session_date,
+                current_time=_aware(current_time or datetime.now(IST)),
+            )
         if hard_tick_limit is not None:
             if hard_tick_limit < 1:
                 raise ValueError("hard_tick_limit must be positive")
@@ -237,7 +267,7 @@ class MarketReplayEngine:
         # As-of views are intentionally ephemeral: a late-arriving tick can still
         # alter an earlier bucket, so persisting an as-of candle would poison the
         # idempotency key for a later complete historical replay.
-        if persist and cutoff is None:
+        if should_persist:
             store.record_candles(result.candles)
             _persist_complete_baselines(store, result.candles, session_date)
         return result
@@ -263,14 +293,37 @@ def _persist_complete_baselines(
             cumulative_by_minute[minute] = cumulative
         complete = set(cumulative_by_minute) == set(range(375))
         trusted = all(item.trusted for item in items)
-        store.record_volume_baseline_session(
-            exchange=exchange,
-            symbol_token=token,
-            session_date=session_date,
-            cumulative_by_minute=cumulative_by_minute,
-            complete=complete,
-            trusted=trusted,
+        if complete and trusted:
+            store.record_volume_baseline_session(
+                exchange=exchange,
+                symbol_token=token,
+                session_date=session_date,
+                cumulative_by_minute=cumulative_by_minute,
+                complete=True,
+                trusted=True,
+            )
+
+
+def _require_completed_session_for_persistence(
+    session_date: date, *, current_time: datetime
+) -> None:
+    now = _aware(current_time)
+    if session_date < now.date():
+        return
+    if session_date == now.date():
+        session_close = datetime.combine(
+            session_date, NSE_SESSION_CLOSE, tzinfo=IST
         )
+        if now >= session_close:
+            return
+        reason = "current_session_not_complete"
+    else:
+        reason = "future_session_not_complete"
+    raise ReplaySessionNotCompleteError(
+        session_date=session_date,
+        current_time=now,
+        reason=reason,
+    )
 
 
 def _aware(value: datetime) -> datetime:
