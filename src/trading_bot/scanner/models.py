@@ -160,6 +160,12 @@ class ScannerResult:
     raw_ticks_replayed: int
     replay_elapsed_seconds: float
     diagnostics: ScannerDiagnostics
+    state_source: str = "DIRECT_INPUT"
+    projection_age_seconds: float | None = None
+    projection_load_seconds: float = 0.0
+    incremental_ticks_processed: int = 0
+    full_replay_used: bool = False
+    projection_last_tick_id: int | None = None
 
     @property
     def qualified_long_signals(self) -> tuple[ScannerCandidate, ...]:
@@ -194,6 +200,12 @@ class ScannerResult:
             "benchmark_failure_count": self.benchmark_failure_count,
             "raw_ticks_replayed": self.raw_ticks_replayed,
             "replay_elapsed_seconds": self.replay_elapsed_seconds,
+            "state_source": self.state_source,
+            "projection_age_seconds": self.projection_age_seconds,
+            "projection_load_seconds": self.projection_load_seconds,
+            "incremental_ticks_processed": self.incremental_ticks_processed,
+            "full_replay_used": self.full_replay_used,
+            "projection_last_tick_id": self.projection_last_tick_id,
             "diagnostics": self.diagnostics.to_dict(),
             "analysis_only": True,
         }

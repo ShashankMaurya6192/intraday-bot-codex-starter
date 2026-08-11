@@ -6,7 +6,14 @@ from decimal import Decimal
 
 import pytest
 
-from trading_bot.domain import IST, Exchange, MarketTick, SubscriptionMode
+from trading_bot.domain import (
+    IST,
+    Exchange,
+    FeedEvent,
+    FeedEventType,
+    MarketTick,
+    SubscriptionMode,
+)
 from trading_bot.storage import (
     SQLiteMarketRecorder,
     TickDrainTimeoutError,
@@ -197,3 +204,38 @@ def test_shutdown_timeout_marks_ingestion_unhealthy() -> None:
     release_writer.set()
     service.stop(timeout_seconds=1, raise_on_failure=False)
     assert service.state is TickIngestionState.UNHEALTHY
+
+
+def test_ticks_and_feed_events_share_one_fifo_writer_path() -> None:
+    order: list[str] = []
+
+    class MarketDataWriter:
+        def record_ticks(self, ticks) -> int:
+            batch = list(ticks)
+            order.extend(f"tick:{item.sequence_number}" for item in batch)
+            return len(batch)
+
+        def record_feed_event(self, event: FeedEvent) -> int:
+            order.append(f"event:{event.event_type.value}")
+            return 1
+
+    service = TickIngestionService(
+        MarketDataWriter(),
+        queue_capacity=10,
+        batch_size=10,
+        flush_interval_seconds=0.01,
+        shutdown_timeout_seconds=1,
+    )
+    service.start()
+    service.submit(_tick(1))
+    service.submit_feed_event(
+        FeedEvent(
+            event_type=FeedEventType.CONNECTED,
+            occurred_at=datetime(2026, 8, 10, 9, 30, 6, tzinfo=IST),
+            message="connected",
+        )
+    )
+    service.submit(_tick(2))
+    service.stop()
+
+    assert order == ["tick:1", "event:CONNECTED", "tick:2"]

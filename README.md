@@ -3,10 +3,11 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.4 preserves deterministic candidate ranking and adds a strict,
-machine-readable signal-qualification gate. It builds on Phase 2.3 causal
-same-day recovery and the explicit PAPER-only research-history fallback.
-Scanner results and qualified signals remain analysis only.
+Phase 2.5 materializes current-session health, candles, and recovery references
+incrementally while `record-scanner-market` runs. Normal scans read that
+checkpointed SQLite projection instead of replaying the full raw-tick day.
+Phase 2.4 ranking and qualification semantics remain unchanged, and scanner
+results and qualified signals remain analysis only.
 There is no paper execution, order interface, or live order-placement code.
 
 ## Safety status
@@ -176,13 +177,31 @@ Scan current locally recorded data:
 python -m trading_bot scan
 python -m trading_bot scan --limit 20
 python -m trading_bot scan --json --limit 20
+python -m trading_bot compare-projection-replay --date 2026-08-11 --json
 ```
+
+Start or restart `record-scanner-market` after upgrading so it can build the
+current-session projection. On its first Phase 2.5 start, it deterministically
+rebuilds the projection once from today's retained raw ticks. Later restarts
+restore the checkpoint and read only raw ticks/feed events after its cursors.
+Normal `scan` never silently falls back to a full-day replay when the projection
+is unavailable or inconsistent.
 
 The ranked candidate lists are preserved even when a candidate is unqualified.
 Human output includes qualification counts and a `QUAL` column. JSON includes
 `qualified`, ordered `qualification_reasons`, `qualified_long_signals`,
 `qualified_short_signals`, and their counts. These are analytical gates only;
 there is still no execution consumer.
+
+Normal JSON output also includes `state_source=INCREMENTAL_PROJECTION`,
+`projection_age_seconds`, `projection_load_seconds`,
+`projection_last_tick_id`, `incremental_ticks_processed`,
+`full_replay_used=false`, and `raw_ticks_replayed=0`. During the live NSE cash
+session, a missing projection or age above
+`SCANNER_PROJECTION_STALE_AFTER_SECONDS` (default `5`) fails closed. A bounded
+suffix catch-up may process at most
+`SCANNER_PROJECTION_CATCH_UP_TICK_LIMIT` ticks (default `10000`); a larger gap
+requires the scanner recorder to catch up and does not trigger full replay.
 
 Bootstrap prior research history explicitly before expecting early-session
 EMA/ATR/RVOL readiness. This command never runs from `record-market`,
@@ -296,7 +315,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.4 architecture
+## Phase 2.5 architecture
 
 ```text
 explicit refresh commands
@@ -311,6 +330,8 @@ explicit SmartAPI historical diagnostic/bootstrap
 recorded SmartAPI ticks
   -> feed-epoch health monitor + sequence telemetry
   -> causal session references + deterministic 09:15 IST candle aggregation
+  -> raw SQLite audit rows
+  -> incremental current-session projection + checkpointed working state
   -> idempotent SQLite candles + complete-session RVOL baselines
   -> replay-safe indicators + NIFTY regime
   -> explainable analysis-only scanner rankings
@@ -323,10 +344,52 @@ recorded SmartAPI ticks
   instrument identity validation.
 - `trading_bot.broker.intraday`: current-date Angel NSE intraday snapshot.
 - `trading_bot.marketdata`: tick health, reconnect epochs, candles, causal
-  replay, historical bootstrap, and market regime.
+  replay, incremental projection, historical bootstrap, and market regime.
 - `trading_bot.indicators`: pure indicator functions with explicit warm-ups.
 - `trading_bot.scanner`: deterministic candidate scoring, diagnostics, and JSON.
-- `trading_bot.storage`: ticks, feed events, candles, and RVOL baselines in SQLite.
+- `trading_bot.storage`: raw ticks/feed events, projected health/references,
+  projection checkpoints, candles, and RVOL baselines in SQLite.
+
+## Incremental projection and restart safety
+
+Scanner recording sends normalized ticks and feed events through one bounded
+FIFO ingestion queue. Each item is committed to authoritative raw audit storage
+before its projection is advanced. If derived-state persistence fails after the
+raw commit, ingestion becomes unhealthy and disconnects the feed; the durable
+cursor remains behind so the next startup can replay that missing suffix. No
+tick is silently discarded between storage and projection.
+
+SQLite materializes:
+
+- `market_health_snapshot`: latest epoch-aware health per instrument;
+- `market_session_reference`: latest, pre-09:20, and pre-09:30 trusted broker
+  session references;
+- `market_projection_checkpoint`: current session, raw tick/feed-event cursors,
+  timestamps, feed epoch, state version, and validated working-engine state;
+- `market_candles`: existing idempotent completed 1m/5m candles, including
+  `ANGEL_SESSION_FIELDS` recovery provenance.
+
+The checkpoint includes in-progress candle buckets, cumulative-volume anchors,
+health recovery counters, and session-reference accumulators. A valid restart
+therefore processes only rows after both cursors. A missing or corrupt
+checkpoint is rebuilt once by `record-scanner-market`; a checkpoint claiming a
+raw tick/event ID ahead of SQLite fails closed because it could indicate lost
+authoritative data. Current-session raw ticks remain retained for audit and the
+explicit `replay` command.
+
+The equivalence command compares projected and replayed health, sequence
+telemetry, completed OHLCV/trust/provenance, references, scanner
+readiness/regime, candidate indicators/scores, and qualification output at the
+same cutoff. It exits non-zero on any mismatch and emits only bounded category
+diagnostics:
+
+```powershell
+python -m trading_bot compare-projection-replay --date 2026-08-11
+python -m trading_bot compare-projection-replay --date 2026-08-11 --json
+```
+
+This verification path intentionally performs raw replay. It has no order
+capability.
 
 ## Data-health meanings
 
@@ -496,12 +559,12 @@ credential-free pytest suite.
 
 ## Phase 3 remains unimplemented
 
-Each as-of scan first counts raw ticks without loading them, rejects a count over
-`SCAN_REPLAY_HARD_TICK_LIMIT`, and reports raw ticks replayed plus replay elapsed
-time. Configurable tick/runtime warnings make current replay cost visible. This
-bounded replay remains a Phase 2.4 bridge: an incremental live intelligence
-worker with persisted health/candle snapshots is the next scaling step before
-any live automation.
+Normal as-of scans load prior historical candles plus current projected state;
+they do not count or replay the full raw-tick day. The raw replay hard limit and
+timing fields remain for explicit `replay`/projection-comparison diagnostics and
+backward-compatible output. Phase 2.5 is still local SQLite architecture: large
+universes need measured paper-session validation, projection-lag monitoring,
+and restart/reconnect testing before any future automation.
 
 Phase 3 may add deterministic paper execution, fill simulation assumptions,
 position/risk state, protective exits, restart recovery, and kill-switch tests.

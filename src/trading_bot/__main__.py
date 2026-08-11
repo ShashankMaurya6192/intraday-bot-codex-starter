@@ -20,7 +20,9 @@ from .domain import IST, Exchange, HistoricalProvider, MarketSubscription
 from .marketdata import (
     Candle,
     HistoricalBootstrapService,
+    MarketIntelligenceProjection,
     MarketReplayEngine,
+    ProjectionError,
     ReplaySafetyLimitExceeded,
     YFinanceHistoricalProvider,
     run_historical_diagnostic,
@@ -37,7 +39,11 @@ from .reference_data.universe import (
     resolve_nse_equity_universe,
 )
 from .scanner import MarketScanner, ScannerWeights
-from .storage import SQLiteMarketRecorder, TickIngestionService
+from .storage import (
+    ProjectionMarketDataWriter,
+    SQLiteMarketRecorder,
+    TickIngestionService,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -108,6 +114,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     scan.add_argument("--json", action="store_true", dest="json_output")
     scan.add_argument("--limit", type=int, default=10)
+    compare = subparsers.add_parser(
+        "compare-projection-replay",
+        help="compare materialized scanner state with deterministic raw replay",
+    )
+    compare.add_argument("--date", required=True, type=_iso_date)
+    compare.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -122,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.4")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -130,6 +142,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Historical provider={settings.historical_provider.value}")
         print(f"Historical fallback enabled={settings.historical_fallback_enabled}")
         print(f"Maximum VWAP distance ATR={settings.max_vwap_distance_atr}")
+        print(
+            "Scanner projection stale after seconds="
+            f"{settings.scanner_projection_stale_after_seconds}"
+        )
         print("Scanner output=ANALYSIS_ONLY")
         print("Paper execution available=False")
         print("Order placement available=False")
@@ -212,6 +228,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--limit must be positive")
         return _scan(settings, json_output=args.json_output, limit=args.limit)
 
+    if command == "compare-projection-replay":
+        return _compare_projection_replay(
+            settings,
+            session_date=args.date,
+            json_output=args.json_output,
+        )
+
     raise AssertionError(f"unhandled command: {command}")
 
 
@@ -253,6 +276,7 @@ def _record_scanner_market(settings: Settings) -> int:
         settings,
         plan.subscriptions,
         description=f"{len(plan.subscriptions)} scanner subscription(s)",
+        incremental_projection=True,
     )
 
 
@@ -261,6 +285,7 @@ def _record_subscriptions(
     subscriptions: Sequence[MarketSubscription],
     *,
     description: str,
+    incremental_projection: bool = False,
 ) -> int:
     if len(subscriptions) > 1_000:
         raise ScannerSubscriptionError(
@@ -281,8 +306,23 @@ def _record_subscriptions(
         reconnect_policy=policy,
     )
     with _recorder(settings) as recorder:
+        projection = None
+        writer = recorder
+        if incremental_projection:
+            projection = _projection(settings, recorder, datetime.now(IST).date())
+            update = projection.initialize(
+                now=datetime.now(IST),
+                allow_rebuild=True,
+            )
+            writer = ProjectionMarketDataWriter(recorder, projection)
+            print(
+                "Scanner projection: "
+                f"rebuilt={update.rebuilt} "
+                f"incremental_ticks_caught_up={update.incremental_ticks_processed} "
+                f"feed_events_caught_up={update.incremental_feed_events_processed}"
+            )
         ingestion = TickIngestionService(
-            recorder,
+            writer,
             queue_capacity=settings.tick_ingestion_queue_capacity,
             batch_size=settings.tick_ingestion_batch_size,
             flush_interval_seconds=settings.tick_ingestion_flush_interval_seconds,
@@ -298,13 +338,19 @@ def _record_subscriptions(
             adapter.stream(
                 subscriptions,
                 ingestion.submit,
-                recorder.record_feed_event,
+                (
+                    ingestion.submit_feed_event
+                    if incremental_projection
+                    else recorder.record_feed_event
+                ),
             )
         except KeyboardInterrupt:
             print("Stopping market recorder...")
         finally:
             adapter.disconnect()
             ingestion.stop(raise_on_failure=False)
+            if projection is not None and ingestion.failure is None:
+                projection.view(now=datetime.now(IST))
         if ingestion.failure is not None:
             raise ingestion.failure
     return 0
@@ -546,6 +592,257 @@ def _replay(settings: Settings, session_date: date, *, json_output: bool) -> int
     return 0
 
 
+def _compare_projection_replay(
+    settings: Settings, *, session_date: date, json_output: bool
+) -> int:
+    """Compare materialized and raw-replay semantics at one deterministic cutoff."""
+    now = datetime.now(IST)
+    session_close = datetime.combine(session_date, time(15, 30), tzinfo=IST)
+    evaluation_at = min(now, session_close)
+    try:
+        instrument_cache = _instrument_cache(settings).load(now=now)
+        intraday_cache = _intraday_cache(settings).load(now=now)
+        nifty_cache = _nifty500_cache(settings).load(now=now)
+        universe = resolve_nse_equity_universe(
+            nifty_cache,
+            instrument_cache,
+            intraday_cache,
+            configured_symbols=settings.configured_scanner_symbols(),
+        )
+        benchmark = instrument_cache.find_trading_symbol(
+            Exchange.NSE_CM, settings.nifty_benchmark_trading_symbol
+        )
+        if benchmark is not None and benchmark.instrument_type != "AMXIDX":
+            benchmark = None
+        with _recorder(settings) as recorder:
+            projection = _projection(settings, recorder, session_date)
+            projection.initialize(
+                now=evaluation_at,
+                allow_rebuild=False,
+                catch_up_tick_limit=settings.scan_replay_hard_tick_limit,
+            )
+            view = projection.view(now=evaluation_at)
+            replay = _replay_engine(settings).replay_date(
+                recorder,
+                session_date,
+                evaluation_at=evaluation_at,
+                persist=False,
+                hard_tick_limit=settings.scan_replay_hard_tick_limit,
+            )
+            projection_scan = _scanner_result_for_comparison(
+                settings=settings,
+                recorder=recorder,
+                universe=universe,
+                benchmark=benchmark,
+                current_candles=view.candles,
+                health=view.health,
+                session_references=view.session_references,
+                opening_references=view.opening_range_references,
+                evaluation_at=evaluation_at,
+            )
+            replay_scan = _scanner_result_for_comparison(
+                settings=settings,
+                recorder=recorder,
+                universe=universe,
+                benchmark=benchmark,
+                current_candles=replay.candles,
+                health=replay.health,
+                session_references=replay.session_references,
+                opening_references=replay.opening_range_references,
+                evaluation_at=evaluation_at,
+            )
+    except (
+        InstrumentMasterError,
+        IntradayUniverseError,
+        Nifty500CacheError,
+        ProjectionError,
+        ReplaySafetyLimitExceeded,
+    ) as exc:
+        payload = {
+            "date": session_date.isoformat(),
+            "as_of": evaluation_at.isoformat(),
+            "equivalent": False,
+            "mismatches": [f"{type(exc).__name__}:{exc}"],
+            "order_placement_available": False,
+        }
+        _print_comparison_payload(payload, json_output=json_output)
+        return 2
+
+    comparisons = {
+        "health": _health_comparison(view.health)
+        == _health_comparison(replay.health),
+        "candles": _candle_comparison(view.candles)
+        == _candle_comparison(replay.candles),
+        "session_references": view.session_references
+        == replay.session_references,
+        "opening_range_references": view.opening_range_references
+        == replay.opening_range_references,
+        "scanner": _scanner_comparison(projection_scan)
+        == _scanner_comparison(replay_scan),
+    }
+    mismatches = [name for name, matched in comparisons.items() if not matched]
+    payload = {
+        "date": session_date.isoformat(),
+        "as_of": evaluation_at.isoformat(),
+        "equivalent": not mismatches,
+        "mismatches": mismatches[:10],
+        "projection_last_tick_id": view.checkpoint.last_tick_id,
+        "raw_ticks_replayed": replay.raw_ticks_replayed,
+        "projection_readiness": projection_scan.readiness.value,
+        "replay_readiness": replay_scan.readiness.value,
+        "order_placement_available": False,
+    }
+    _print_comparison_payload(payload, json_output=json_output)
+    return 0 if not mismatches else 2
+
+
+def _scanner_result_for_comparison(
+    *,
+    settings: Settings,
+    recorder: SQLiteMarketRecorder,
+    universe,
+    benchmark,
+    current_candles: Sequence[Candle],
+    health: Sequence,
+    session_references: Sequence,
+    opening_references: Sequence,
+    evaluation_at: datetime,
+):
+    historical_start = datetime.combine(
+        evaluation_at.date()
+        - timedelta(days=settings.historical_bootstrap_lookback_days),
+        time.min,
+        tzinfo=IST,
+    )
+    session_start = datetime.combine(evaluation_at.date(), time.min, tzinfo=IST)
+    prior = recorder.load_candles(
+        start_at=historical_start,
+        end_at=session_start,
+    )
+    candles_by = _candles_by_instrument((*prior, *current_candles))
+    health_by = {(item.exchange, item.symbol_token): item for item in health}
+    return _market_scanner(settings).scan(
+        instruments=universe.instruments,
+        candles_by_instrument=candles_by,
+        health_by_instrument=health_by,
+        benchmark=benchmark,
+        baseline_store=recorder,
+        now=evaluation_at,
+        expected_eligibility_diagnostics=[
+            f"{item.symbol}:{item.reason}"
+            for item in universe.expected_eligibility_exclusions
+        ],
+        reference_diagnostics=[
+            f"{item.symbol}:{item.reason}" for item in universe.mapping_failures
+        ],
+        requested_count=len(settings.configured_scanner_symbols()),
+        session_references={
+            (item.exchange, item.symbol_token): item for item in session_references
+        },
+        opening_range_references={
+            (item.exchange, item.symbol_token): item for item in opening_references
+        },
+    )
+
+
+def _candles_by_instrument(
+    candles: Sequence[Candle],
+) -> dict[tuple[Exchange, str], list[Candle]]:
+    grouped: dict[
+        tuple[Exchange, str], dict[tuple[int, datetime], Candle]
+    ] = {}
+    for candle in candles:
+        grouped.setdefault((candle.exchange, candle.symbol_token), {})[
+            (int(candle.interval), candle.start_at)
+        ] = candle
+    return {
+        key: sorted(values.values(), key=lambda item: (item.start_at, item.interval))
+        for key, values in grouped.items()
+    }
+
+
+def _health_comparison(items: Sequence) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            item.exchange.value,
+            item.symbol_token,
+            item.feed_epoch,
+            item.status.value,
+            item.latest_exchange_timestamp,
+            item.latest_received_timestamp,
+            item.sequence_number,
+            item.duplicate_count,
+            item.out_of_order_count,
+            item.sequence_jump_count,
+        )
+        for item in items
+    )
+
+
+def _candle_comparison(items: Sequence[Candle]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            item.exchange.value,
+            item.symbol_token,
+            int(item.interval),
+            item.start_at,
+            item.end_at,
+            item.open_price,
+            item.high_price,
+            item.low_price,
+            item.close_price,
+            item.volume,
+            item.tick_count,
+            item.trusted,
+            item.provenance.value,
+        )
+        for item in sorted(
+            items,
+            key=lambda candle: (
+                candle.exchange.value,
+                candle.symbol_token,
+                candle.start_at,
+                candle.interval,
+            ),
+        )
+    )
+
+
+def _scanner_comparison(result) -> dict[str, object]:
+    payload = result.to_dict()
+    return {
+        key: payload[key]
+        for key in (
+            "readiness",
+            "market_regime",
+            "long_candidates",
+            "short_candidates",
+            "qualified_long_signals",
+            "qualified_short_signals",
+            "evaluated_count",
+            "rejected_count",
+            "unhealthy_count",
+            "diagnostics",
+        )
+    }
+
+
+def _print_comparison_payload(
+    payload: dict[str, object], *, json_output: bool
+) -> None:
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(
+        "Projection/replay comparison: "
+        f"date={payload['date']} equivalent={payload['equivalent']} "
+        f"as_of={payload['as_of']}"
+    )
+    for mismatch in payload.get("mismatches", []):
+        print(f"  mismatch={mismatch}")
+    print("Order placement available=False")
+
+
 def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
     now = datetime.now(IST)
     try:
@@ -593,62 +890,59 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             "unhealthy_count": 0,
             "raw_ticks_replayed": 0,
             "replay_elapsed_seconds": 0.0,
+            "state_source": "INCREMENTAL_PROJECTION",
+            "projection_age_seconds": None,
+            "projection_load_seconds": 0.0,
+            "incremental_ticks_processed": 0,
+            "full_replay_used": False,
+            "projection_last_tick_id": None,
         }
         _print_scan_payload(payload, json_output=json_output, limit=limit)
         return 2
 
     with _recorder(settings) as recorder:
-        replay_started = perf_counter()
+        projection_started = perf_counter()
         try:
-            replay = _replay_engine(settings).replay_date(
-                recorder,
-                now.date(),
-                evaluation_at=now,
-                persist=False,
-                hard_tick_limit=settings.scan_replay_hard_tick_limit,
+            projection = _projection(settings, recorder, now.date())
+            update = projection.initialize(
+                now=now,
+                allow_rebuild=False,
+                catch_up_tick_limit=(
+                    settings.scanner_projection_catch_up_tick_limit
+                ),
             )
-        except ReplaySafetyLimitExceeded as exc:
-            payload = {
-                "readiness": "NOT_READY",
-                "market_regime": "UNKNOWN",
-                "diagnostics": {
-                    "expected_eligibility_exclusions": [],
-                    "reference_failures": [],
-                    "unhealthy_market_data": [],
-                    "indicator_not_ready": [],
-                    "benchmark_failures": [],
-                    "scaling_warnings": [
-                        "raw_tick_hard_limit_exceeded:"
-                        f"{exc.tick_count}>{exc.hard_limit}"
-                    ],
-                },
-                "analysis_only": True,
-                "long_candidates": [],
-                "short_candidates": [],
-                "qualified_long_signals": [],
-                "qualified_short_signals": [],
-                "qualified_long_count": 0,
-                "qualified_short_count": 0,
-                "requested_count": len(settings.configured_scanner_symbols())
-                or len(nifty_cache.constituents),
-                "eligible_count": len(universe.instruments),
-                "expected_ineligible_count": len(
-                    universe.expected_eligibility_exclusions
-                ),
-                "mapping_failure_count": len(universe.mapping_failures),
-                "indicator_not_ready_count": 0,
-                "benchmark_failure_count": 0,
-                "evaluated_count": 0,
-                "rejected_count": 0,
-                "unhealthy_count": 0,
-                "raw_ticks_replayed": exc.tick_count,
-                "replay_elapsed_seconds": round(
-                    perf_counter() - replay_started, 6
-                ),
-            }
+            view = projection.view(now=now)
+        except ProjectionError as exc:
+            payload = _projection_not_ready_payload(
+                settings=settings,
+                nifty_count=len(nifty_cache.constituents),
+                universe=universe,
+                reason=f"{type(exc).__name__}:{exc}",
+                load_seconds=perf_counter() - projection_started,
+            )
             _print_scan_payload(payload, json_output=json_output, limit=limit)
             return 2
-        replay_elapsed = perf_counter() - replay_started
+        projection_load_seconds = perf_counter() - projection_started
+        projection_age = view.projection_age_seconds
+        freshness_reason = _projection_freshness_reason(
+            now=now,
+            projection_age_seconds=projection_age,
+            last_received_at=view.checkpoint.last_received_at,
+            stale_after_seconds=settings.scanner_projection_stale_after_seconds,
+        )
+        if freshness_reason is not None:
+            payload = _projection_not_ready_payload(
+                settings=settings,
+                nifty_count=len(nifty_cache.constituents),
+                universe=universe,
+                reason=freshness_reason,
+                load_seconds=projection_load_seconds,
+                projection_age_seconds=projection_age,
+                last_tick_id=view.checkpoint.last_tick_id,
+                incremental_ticks_processed=update.incremental_ticks_processed,
+            )
+            _print_scan_payload(payload, json_output=json_output, limit=limit)
+            return 2
         historical_start = datetime.combine(
             now.date() - timedelta(days=settings.historical_bootstrap_lookback_days),
             time.min,
@@ -658,59 +952,27 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             start_at=historical_start,
             end_at=now,
         )
-        candles_by_key: dict[
-            tuple[Exchange, str], dict[tuple[int, datetime], Candle]
-        ] = {}
+        candles_by_key: dict[tuple[Exchange, str], list[Candle]] = {}
         for candle in persisted_candles:
-            candles_by_key.setdefault(
-                (candle.exchange, candle.symbol_token), {}
-            )[(int(candle.interval), candle.start_at)] = candle
-        for candle in replay.candles:
-            candles_by_key.setdefault(
-                (candle.exchange, candle.symbol_token), {}
-            )[(int(candle.interval), candle.start_at)] = candle
+            key = (candle.exchange, candle.symbol_token)
+            candles_by_key.setdefault(key, []).append(candle)
         candles_by = {
-            key: sorted(
-                values.values(), key=lambda item: (item.start_at, item.interval)
-            )
+            key: sorted(values, key=lambda item: (item.start_at, item.interval))
             for key, values in candles_by_key.items()
         }
         health_by = {
-            (health.exchange, health.symbol_token): health for health in replay.health
+            (health.exchange, health.symbol_token): health for health in view.health
         }
-        scanner = MarketScanner(
-            weights=ScannerWeights(
-                vwap=settings.scanner_weight_vwap,
-                ema=settings.scanner_weight_ema,
-                relative_volume=settings.scanner_weight_relative_volume,
-                relative_strength=settings.scanner_weight_relative_strength,
-                opening_range_proximity=settings.scanner_weight_opening_range,
-                market_regime=settings.scanner_weight_market_regime,
-            ),
-            relative_volume_threshold=settings.relative_volume_threshold,
-            relative_volume_lookback_sessions=(
-                settings.relative_volume_lookback_sessions
-            ),
-            relative_volume_minimum_sessions=(
-                settings.relative_volume_minimum_sessions
-            ),
-            opening_range_minutes=settings.opening_range_minutes,
-            breakout_proximity_pct=settings.scanner_breakout_proximity_pct,
-            regime_momentum_threshold_pct=(settings.regime_momentum_threshold_pct),
-            regime_slope_lookback_candles=(settings.regime_slope_lookback_candles),
-            max_vwap_distance_atr=settings.max_vwap_distance_atr,
-        )
+        scanner = _market_scanner(settings)
         scaling_warnings: list[str] = []
-        if replay.raw_ticks_replayed > settings.scan_replay_warning_tick_count:
+        if update.incremental_ticks_processed:
             scaling_warnings.append(
-                "raw_tick_warning_threshold_exceeded:"
-                f"{replay.raw_ticks_replayed}>"
-                f"{settings.scan_replay_warning_tick_count}"
+                f"projection_suffix_catch_up:{update.incremental_ticks_processed}"
             )
-        if replay_elapsed > settings.scan_replay_warning_seconds:
+        if projection_load_seconds > settings.scan_replay_warning_seconds:
             scaling_warnings.append(
-                "replay_runtime_warning_threshold_exceeded:"
-                f"{replay_elapsed:.6f}>"
+                "projection_load_runtime_warning_threshold_exceeded:"
+                f"{projection_load_seconds:.6f}>"
                 f"{settings.scan_replay_warning_seconds}"
             )
         result = scanner.scan(
@@ -729,21 +991,133 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             ],
             requested_count=len(settings.configured_scanner_symbols())
             or len(nifty_cache.constituents),
-            raw_ticks_replayed=replay.raw_ticks_replayed,
-            replay_elapsed_seconds=round(replay_elapsed, 6),
+            raw_ticks_replayed=0,
+            replay_elapsed_seconds=0.0,
             scaling_warnings=scaling_warnings,
             session_references={
                 (item.exchange, item.symbol_token): item
-                for item in replay.session_references
+                for item in view.session_references
             },
             opening_range_references={
                 (item.exchange, item.symbol_token): item
-                for item in replay.opening_range_references
+                for item in view.opening_range_references
             },
+            state_source="INCREMENTAL_PROJECTION",
+            projection_age_seconds=(
+                None if projection_age is None else round(projection_age, 6)
+            ),
+            projection_load_seconds=round(projection_load_seconds, 6),
+            incremental_ticks_processed=update.incremental_ticks_processed,
+            full_replay_used=False,
+            projection_last_tick_id=view.checkpoint.last_tick_id,
         )
     payload = result.to_dict()
     _print_scan_payload(payload, json_output=json_output, limit=limit)
     return 0 if result.readiness.value == "READY" else 2
+
+
+def _projection_not_ready_payload(
+    *,
+    settings: Settings,
+    nifty_count: int,
+    universe,
+    reason: str,
+    load_seconds: float,
+    projection_age_seconds: float | None = None,
+    last_tick_id: int | None = None,
+    incremental_ticks_processed: int = 0,
+) -> dict[str, object]:
+    return {
+        "readiness": "NOT_READY",
+        "market_regime": "UNKNOWN",
+        "diagnostics": {
+            "expected_eligibility_exclusions": [],
+            "reference_failures": [],
+            "unhealthy_market_data": [],
+            "indicator_not_ready": [],
+            "benchmark_failures": [reason],
+            "scaling_warnings": [],
+        },
+        "analysis_only": True,
+        "long_candidates": [],
+        "short_candidates": [],
+        "qualified_long_signals": [],
+        "qualified_short_signals": [],
+        "qualified_long_count": 0,
+        "qualified_short_count": 0,
+        "requested_count": len(settings.configured_scanner_symbols()) or nifty_count,
+        "eligible_count": len(universe.instruments),
+        "expected_ineligible_count": len(
+            universe.expected_eligibility_exclusions
+        ),
+        "mapping_failure_count": len(universe.mapping_failures),
+        "indicator_not_ready_count": 0,
+        "benchmark_failure_count": 1,
+        "evaluated_count": 0,
+        "rejected_count": 0,
+        "unhealthy_count": 0,
+        "raw_ticks_replayed": 0,
+        "replay_elapsed_seconds": 0.0,
+        "state_source": "INCREMENTAL_PROJECTION",
+        "projection_age_seconds": (
+            None
+            if projection_age_seconds is None
+            else round(projection_age_seconds, 6)
+        ),
+        "projection_load_seconds": round(load_seconds, 6),
+        "incremental_ticks_processed": incremental_ticks_processed,
+        "full_replay_used": False,
+        "projection_last_tick_id": last_tick_id,
+    }
+
+
+def _market_expected_live(now: datetime) -> bool:
+    local_time = now.astimezone(IST).timetz().replace(tzinfo=None)
+    return time(9, 15) <= local_time < time(15, 30)
+
+
+def _projection_freshness_reason(
+    *,
+    now: datetime,
+    projection_age_seconds: float | None,
+    last_received_at: datetime | None,
+    stale_after_seconds: float,
+) -> str | None:
+    if last_received_at is not None and last_received_at > now:
+        return "projection_timestamp_in_future"
+    if not _market_expected_live(now):
+        return None
+    if (
+        projection_age_seconds is None
+        or projection_age_seconds > stale_after_seconds
+    ):
+        return f"projection_stale:{projection_age_seconds}>{stale_after_seconds}"
+    return None
+
+
+def _market_scanner(settings: Settings) -> MarketScanner:
+    return MarketScanner(
+        weights=ScannerWeights(
+            vwap=settings.scanner_weight_vwap,
+            ema=settings.scanner_weight_ema,
+            relative_volume=settings.scanner_weight_relative_volume,
+            relative_strength=settings.scanner_weight_relative_strength,
+            opening_range_proximity=settings.scanner_weight_opening_range,
+            market_regime=settings.scanner_weight_market_regime,
+        ),
+        relative_volume_threshold=settings.relative_volume_threshold,
+        relative_volume_lookback_sessions=(
+            settings.relative_volume_lookback_sessions
+        ),
+        relative_volume_minimum_sessions=(
+            settings.relative_volume_minimum_sessions
+        ),
+        opening_range_minutes=settings.opening_range_minutes,
+        breakout_proximity_pct=settings.scanner_breakout_proximity_pct,
+        regime_momentum_threshold_pct=settings.regime_momentum_threshold_pct,
+        regime_slope_lookback_candles=settings.regime_slope_lookback_candles,
+        max_vwap_distance_atr=settings.max_vwap_distance_atr,
+    )
 
 
 def _print_scan_payload(
@@ -773,7 +1147,13 @@ def _print_scan_payload(
         f"qualified_long={payload.get('qualified_long_count', 0)} "
         f"qualified_short={payload.get('qualified_short_count', 0)} "
         f"raw_ticks_replayed={payload.get('raw_ticks_replayed', 0)} "
-        f"replay_elapsed_seconds={payload.get('replay_elapsed_seconds', 0.0)}"
+        f"replay_elapsed_seconds={payload.get('replay_elapsed_seconds', 0.0)} "
+        f"state_source={payload.get('state_source', 'UNKNOWN')} "
+        f"projection_age_seconds={payload.get('projection_age_seconds')} "
+        f"projection_load_seconds={payload.get('projection_load_seconds', 0.0)} "
+        f"incremental_ticks_processed="
+        f"{payload.get('incremental_ticks_processed', 0)} "
+        f"full_replay_used={payload.get('full_replay_used', False)}"
     )
     print("BIAS  SYMBOL              SCORE QUAL      LTP     RVOL       RS")
     for bias_key in ("long_candidates", "short_candidates"):
@@ -860,6 +1240,19 @@ def _nifty500_cache(settings: Settings) -> Nifty500Cache:
 
 def _replay_engine(settings: Settings) -> MarketReplayEngine:
     return MarketReplayEngine(
+        stale_after_seconds=settings.market_data_stale_after_seconds,
+        recovery_consecutive_ticks=settings.market_data_recovery_consecutive_ticks,
+    )
+
+
+def _projection(
+    settings: Settings,
+    recorder: SQLiteMarketRecorder,
+    session_date: date,
+) -> MarketIntelligenceProjection:
+    return MarketIntelligenceProjection(
+        recorder,
+        session_date=session_date,
         stale_after_seconds=settings.market_data_stale_after_seconds,
         recovery_consecutive_ticks=settings.market_data_recovery_consecutive_ticks,
     )

@@ -23,6 +23,8 @@ def test_default_is_paper() -> None:
     assert settings.historical_bootstrap_lookback_days == 30
     assert settings.historical_bootstrap_minimum_sessions == 15
     assert settings.scan_replay_hard_tick_limit == 2_000_000
+    assert settings.scanner_projection_stale_after_seconds == 5
+    assert settings.scanner_projection_catch_up_tick_limit == 10_000
     assert not hasattr(settings, "market_data_allowed_sequence_gap")
     assert settings.configured_scanner_symbols() == ()
 
@@ -120,3 +122,10 @@ def test_scanner_symbol_override_and_rvol_warmup_are_validated() -> None:
     duplicate = Settings(_env_file=None, scanner_symbols="SBIN,SBIN")
     with pytest.raises(ValueError, match="duplicates"):
         duplicate.configured_scanner_symbols()
+
+
+def test_projection_freshness_and_catch_up_bounds_are_positive() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, scanner_projection_stale_after_seconds=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, scanner_projection_catch_up_tick_limit=0)

@@ -21,8 +21,16 @@ from trading_bot.domain import (
     MarketTick,
     SubscriptionMode,
 )
-from trading_bot.marketdata import Candle, CandleInterval, MarketDataProvenance
+from trading_bot.marketdata import (
+    Candle,
+    CandleInterval,
+    InstrumentHealth,
+    MarketDataHealthStatus,
+    MarketDataProvenance,
+    SessionReference,
+)
 from trading_bot.marketdata.history import HistoricalBootstrapStatus
+from trading_bot.marketdata.projection import ProjectionCheckpoint
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -121,6 +129,55 @@ CREATE TABLE IF NOT EXISTS historical_bootstrap_status (
     provenance TEXT NOT NULL DEFAULT 'ANGEL_HISTORICAL',
     PRIMARY KEY (exchange, symbol_token)
 );
+
+CREATE TABLE IF NOT EXISTS market_health_snapshot (
+    session_date TEXT NOT NULL,
+    exchange TEXT NOT NULL,
+    symbol_token TEXT NOT NULL,
+    feed_epoch INTEGER NOT NULL CHECK (feed_epoch >= 0),
+    status TEXT NOT NULL,
+    latest_exchange_timestamp TEXT,
+    latest_received_timestamp TEXT,
+    sequence_number INTEGER,
+    data_age_seconds REAL,
+    duplicate_count INTEGER NOT NULL CHECK (duplicate_count >= 0),
+    out_of_order_count INTEGER NOT NULL CHECK (out_of_order_count >= 0),
+    sequence_jump_count INTEGER NOT NULL CHECK (sequence_jump_count >= 0),
+    last_health_transition TEXT NOT NULL,
+    PRIMARY KEY (session_date, exchange, symbol_token)
+);
+
+CREATE TABLE IF NOT EXISTS market_session_reference (
+    session_date TEXT NOT NULL,
+    reference_kind TEXT NOT NULL CHECK (
+        reference_kind IN ('LATEST', 'BEFORE_FIRST_FIVE', 'BEFORE_OPENING_RANGE')
+    ),
+    exchange TEXT NOT NULL,
+    symbol_token TEXT NOT NULL,
+    trading_symbol TEXT,
+    observed_at TEXT NOT NULL,
+    session_open TEXT NOT NULL,
+    session_high TEXT NOT NULL,
+    session_low TEXT NOT NULL,
+    last_traded_price TEXT NOT NULL,
+    average_traded_price TEXT,
+    cumulative_volume INTEGER,
+    provenance TEXT NOT NULL,
+    trusted INTEGER NOT NULL CHECK (trusted IN (0, 1)),
+    PRIMARY KEY (session_date, reference_kind, exchange, symbol_token)
+);
+
+CREATE TABLE IF NOT EXISTS market_projection_checkpoint (
+    session_date TEXT PRIMARY KEY,
+    last_tick_id INTEGER NOT NULL CHECK (last_tick_id >= 0),
+    last_feed_event_id INTEGER NOT NULL CHECK (last_feed_event_id >= 0),
+    last_received_at TEXT,
+    last_feed_event_at TEXT,
+    feed_epoch INTEGER NOT NULL CHECK (feed_epoch >= 0),
+    updated_at TEXT NOT NULL,
+    state_version INTEGER NOT NULL CHECK (state_version > 0),
+    state_json TEXT NOT NULL
+);
 """
 
 
@@ -210,6 +267,13 @@ class SQLiteMarketRecorder:
                 """,
                 (4, datetime.now(IST).isoformat()),
             )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_version(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (5, datetime.now(IST).isoformat()),
+            )
             self._connection.commit()
 
     def record_tick(self, tick: MarketTick) -> bool:
@@ -228,6 +292,23 @@ class SQLiteMarketRecorder:
             for value in values:
                 cursor = self._connection.execute(_INSERT_TICK, value)
                 inserted += int(cursor.rowcount == 1)
+        return inserted
+
+    def record_ticks_with_ids(
+        self, ticks: Iterable[MarketTick]
+    ) -> list[tuple[int, MarketTick]]:
+        """Atomically persist a batch and return only newly inserted row identities."""
+        items = list(ticks)
+        if not items:
+            return []
+        inserted: list[tuple[int, MarketTick]] = []
+        with self._lock, self._connection:
+            for tick in items:
+                cursor = self._connection.execute(_INSERT_TICK, _tick_values(tick))
+                if cursor.rowcount == 1:
+                    if cursor.lastrowid is None:
+                        raise RuntimeError("SQLite did not return a tick row ID")
+                    inserted.append((int(cursor.lastrowid), tick))
         return inserted
 
     def record_feed_event(self, event: FeedEvent) -> int:
@@ -295,6 +376,52 @@ class SQLiteMarketRecorder:
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
         return [_row_to_tick(row) for row in rows]
+
+    def load_tick_records_after(
+        self,
+        session_date: date,
+        *,
+        after_id: int,
+        received_at_or_before: datetime,
+        limit: int | None = None,
+    ) -> list[tuple[int, MarketTick]]:
+        if after_id < 0:
+            raise ValueError("after_id must be non-negative")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        start_at, end_at = _session_iso_bounds(session_date)
+        sql = """
+            SELECT * FROM market_ticks
+            WHERE id > ? AND exchange_timestamp >= ? AND exchange_timestamp < ?
+            ORDER BY id
+        """
+        parameters: list[object] = [after_id, start_at, end_at]
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        cutoff = datetime.fromisoformat(_aware_iso(received_at_or_before))
+        visible: list[tuple[int, MarketTick]] = []
+        for row in rows:
+            tick = _row_to_tick(row)
+            if tick.received_at > cutoff:
+                break
+            visible.append((int(row["id"]), tick))
+        return visible
+
+    def max_tick_id(self, session_date: date) -> int:
+        start_at, end_at = _session_iso_bounds(session_date)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM market_ticks
+                WHERE exchange_timestamp >= ? AND exchange_timestamp < ?
+                """,
+                (start_at, end_at),
+            ).fetchone()
+        return int(row["max_id"])
 
     def record_candles(self, candles: Iterable[Candle]) -> int:
         """Persist completed candles idempotently in one transaction."""
@@ -634,6 +761,269 @@ class SQLiteMarketRecorder:
             for row in rows
         ]
 
+    def load_feed_event_records_after(
+        self,
+        session_date: date,
+        *,
+        after_id: int,
+        occurred_at_or_before: datetime,
+    ) -> list[tuple[int, FeedEvent]]:
+        if after_id < 0:
+            raise ValueError("after_id must be non-negative")
+        start_at, end_at = _session_iso_bounds(session_date)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM market_feed_events
+                WHERE id > ? AND occurred_at >= ? AND occurred_at < ?
+                ORDER BY id
+                """,
+                (after_id, start_at, end_at),
+            ).fetchall()
+        cutoff = datetime.fromisoformat(_aware_iso(occurred_at_or_before))
+        visible: list[tuple[int, FeedEvent]] = []
+        for row in rows:
+            event = FeedEvent(
+                event_type=FeedEventType(row["event_type"]),
+                occurred_at=datetime.fromisoformat(row["occurred_at"]),
+                message=row["message"],
+                details=json.loads(row["details"]),
+            )
+            if event.occurred_at > cutoff:
+                break
+            visible.append((int(row["id"]), event))
+        return visible
+
+    def max_feed_event_id(self, session_date: date) -> int:
+        start_at, end_at = _session_iso_bounds(session_date)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM market_feed_events
+                WHERE occurred_at >= ? AND occurred_at < ?
+                """,
+                (start_at, end_at),
+            ).fetchone()
+        return int(row["max_id"])
+
+    def load_projection_checkpoint(
+        self, session_date: date
+    ) -> ProjectionCheckpoint | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM market_projection_checkpoint
+                WHERE session_date = ?
+                """,
+                (session_date.isoformat(),),
+            ).fetchone()
+        if row is None:
+            return None
+        engine_state = json.loads(row["state_json"])
+        if not isinstance(engine_state, dict):
+            raise ValueError("projection state_json must contain an object")
+        return ProjectionCheckpoint(
+            session_date=date.fromisoformat(row["session_date"]),
+            last_tick_id=int(row["last_tick_id"]),
+            last_feed_event_id=int(row["last_feed_event_id"]),
+            last_received_at=_optional_datetime(row["last_received_at"]),
+            last_feed_event_at=_optional_datetime(row["last_feed_event_at"]),
+            feed_epoch=int(row["feed_epoch"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            state_version=int(row["state_version"]),
+            engine_state=engine_state,
+        )
+
+    def load_projection_health(self, session_date: date) -> list[InstrumentHealth]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM market_health_snapshot
+                WHERE session_date = ?
+                ORDER BY exchange, symbol_token
+                """,
+                (session_date.isoformat(),),
+            ).fetchall()
+        return [
+            InstrumentHealth(
+                exchange=Exchange(row["exchange"]),
+                symbol_token=row["symbol_token"],
+                feed_epoch=int(row["feed_epoch"]),
+                status=MarketDataHealthStatus(row["status"]),
+                latest_exchange_timestamp=_optional_datetime(
+                    row["latest_exchange_timestamp"]
+                ),
+                latest_received_timestamp=_optional_datetime(
+                    row["latest_received_timestamp"]
+                ),
+                sequence_number=(
+                    None
+                    if row["sequence_number"] is None
+                    else int(row["sequence_number"])
+                ),
+                data_age_seconds=(
+                    None
+                    if row["data_age_seconds"] is None
+                    else float(row["data_age_seconds"])
+                ),
+                duplicate_count=int(row["duplicate_count"]),
+                out_of_order_count=int(row["out_of_order_count"]),
+                sequence_jump_count=int(row["sequence_jump_count"]),
+                last_health_transition=datetime.fromisoformat(
+                    row["last_health_transition"]
+                ),
+            )
+            for row in rows
+        ]
+
+    def load_projection_references(
+        self, session_date: date, *, reference_kind: str
+    ) -> list[SessionReference]:
+        if reference_kind not in {
+            "LATEST",
+            "BEFORE_FIRST_FIVE",
+            "BEFORE_OPENING_RANGE",
+        }:
+            raise ValueError("unsupported projection reference kind")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM market_session_reference
+                WHERE session_date = ? AND reference_kind = ?
+                ORDER BY exchange, symbol_token
+                """,
+                (session_date.isoformat(), reference_kind),
+            ).fetchall()
+        return [_row_to_session_reference(row) for row in rows]
+
+    def save_projection_state(
+        self,
+        *,
+        checkpoint: ProjectionCheckpoint,
+        health: Sequence[InstrumentHealth],
+        latest_references: Sequence[SessionReference],
+        first_five_references: Sequence[SessionReference],
+        opening_range_references: Sequence[SessionReference],
+        candles: Sequence[Candle],
+    ) -> None:
+        """Atomically replace materialized snapshots and advance the checkpoint."""
+        session_text = checkpoint.session_date.isoformat()
+        reference_groups = (
+            ("LATEST", latest_references),
+            ("BEFORE_FIRST_FIVE", first_five_references),
+            ("BEFORE_OPENING_RANGE", opening_range_references),
+        )
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                """
+                SELECT last_tick_id, last_feed_event_id
+                FROM market_projection_checkpoint
+                WHERE session_date = ?
+                """,
+                (session_text,),
+            ).fetchone()
+            if existing is not None and (
+                int(existing["last_tick_id"]) > checkpoint.last_tick_id
+                or int(existing["last_feed_event_id"])
+                > checkpoint.last_feed_event_id
+            ):
+                raise ValueError("projection checkpoint cursor cannot move backward")
+            for candle in candles:
+                self._connection.execute(_INSERT_CANDLE, _candle_values(candle))
+            self._connection.execute(
+                "DELETE FROM market_health_snapshot WHERE session_date = ?",
+                (session_text,),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO market_health_snapshot(
+                    session_date, exchange, symbol_token, feed_epoch, status,
+                    latest_exchange_timestamp, latest_received_timestamp,
+                    sequence_number, data_age_seconds, duplicate_count,
+                    out_of_order_count, sequence_jump_count,
+                    last_health_transition
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [_health_values(checkpoint.session_date, item) for item in health],
+            )
+            self._connection.execute(
+                "DELETE FROM market_session_reference WHERE session_date = ?",
+                (session_text,),
+            )
+            reference_rows = [
+                _session_reference_values(kind, item)
+                for kind, references in reference_groups
+                for item in references
+            ]
+            if reference_rows:
+                self._connection.executemany(
+                    """
+                    INSERT INTO market_session_reference(
+                        session_date, reference_kind, exchange, symbol_token,
+                        trading_symbol, observed_at, session_open, session_high,
+                        session_low, last_traded_price, average_traded_price,
+                        cumulative_volume, provenance, trusted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    reference_rows,
+                )
+            self._connection.execute(
+                """
+                INSERT INTO market_projection_checkpoint(
+                    session_date, last_tick_id, last_feed_event_id,
+                    last_received_at, last_feed_event_at, feed_epoch, updated_at,
+                    state_version, state_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_date) DO UPDATE SET
+                    last_tick_id = excluded.last_tick_id,
+                    last_feed_event_id = excluded.last_feed_event_id,
+                    last_received_at = excluded.last_received_at,
+                    last_feed_event_at = excluded.last_feed_event_at,
+                    feed_epoch = excluded.feed_epoch,
+                    updated_at = excluded.updated_at,
+                    state_version = excluded.state_version,
+                    state_json = excluded.state_json
+                """,
+                (
+                    session_text,
+                    checkpoint.last_tick_id,
+                    checkpoint.last_feed_event_id,
+                    _optional_datetime_iso(checkpoint.last_received_at),
+                    _optional_datetime_iso(checkpoint.last_feed_event_at),
+                    checkpoint.feed_epoch,
+                    checkpoint.updated_at.isoformat(),
+                    checkpoint.state_version,
+                    _json(checkpoint.engine_state),
+                ),
+            )
+
+    def clear_projection_session(self, session_date: date) -> None:
+        """Discard derived state while preserving authoritative raw rows."""
+        start_at, end_at = _session_iso_bounds(session_date)
+        session_text = session_date.isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM market_health_snapshot WHERE session_date = ?",
+                (session_text,),
+            )
+            self._connection.execute(
+                "DELETE FROM market_session_reference WHERE session_date = ?",
+                (session_text,),
+            )
+            self._connection.execute(
+                "DELETE FROM market_projection_checkpoint WHERE session_date = ?",
+                (session_text,),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM market_candles
+                WHERE start_at >= ? AND start_at < ?
+                  AND provenance IN ('LOCAL_TICKS', 'ANGEL_SESSION_FIELDS')
+                """,
+                (start_at, end_at),
+            )
+
     def count_ticks(
         self,
         *,
@@ -827,6 +1217,65 @@ def _row_to_candle(row: sqlite3.Row) -> Candle:
     )
 
 
+def _health_values(
+    session_date: date, health: InstrumentHealth
+) -> tuple[object, ...]:
+    return (
+        session_date.isoformat(),
+        health.exchange.value,
+        health.symbol_token,
+        health.feed_epoch,
+        health.status.value,
+        _optional_datetime_iso(health.latest_exchange_timestamp),
+        _optional_datetime_iso(health.latest_received_timestamp),
+        health.sequence_number,
+        health.data_age_seconds,
+        health.duplicate_count,
+        health.out_of_order_count,
+        health.sequence_jump_count,
+        health.last_health_transition.isoformat(),
+    )
+
+
+def _session_reference_values(
+    reference_kind: str, reference: SessionReference
+) -> tuple[object, ...]:
+    return (
+        reference.session_date.isoformat(),
+        reference_kind,
+        reference.exchange.value,
+        reference.symbol_token,
+        reference.trading_symbol,
+        reference.observed_at.isoformat(),
+        str(reference.session_open),
+        str(reference.session_high),
+        str(reference.session_low),
+        str(reference.last_traded_price),
+        _optional_decimal_string(reference.average_traded_price),
+        reference.cumulative_volume,
+        reference.provenance.value,
+        int(reference.trusted),
+    )
+
+
+def _row_to_session_reference(row: sqlite3.Row) -> SessionReference:
+    return SessionReference(
+        exchange=Exchange(row["exchange"]),
+        symbol_token=row["symbol_token"],
+        trading_symbol=row["trading_symbol"],
+        session_date=date.fromisoformat(row["session_date"]),
+        observed_at=datetime.fromisoformat(row["observed_at"]),
+        session_open=Decimal(row["session_open"]),
+        session_high=Decimal(row["session_high"]),
+        session_low=Decimal(row["session_low"]),
+        last_traded_price=Decimal(row["last_traded_price"]),
+        average_traded_price=_optional_decimal(row["average_traded_price"]),
+        cumulative_volume=row["cumulative_volume"],
+        provenance=MarketDataProvenance(row["provenance"]),
+        trusted=bool(row["trusted"]),
+    )
+
+
 def _ensure_column(
     connection: sqlite3.Connection,
     *,
@@ -849,6 +1298,14 @@ def _optional_decimal(value: str | None) -> Decimal | None:
     return None if value is None else Decimal(value)
 
 
+def _optional_datetime(value: str | None) -> datetime | None:
+    return None if value is None else datetime.fromisoformat(value)
+
+
+def _optional_datetime_iso(value: datetime | None) -> str | None:
+    return None if value is None else _aware_iso(value)
+
+
 def _json(value: object) -> str:
     return json.dumps(
         value,
@@ -863,3 +1320,8 @@ def _aware_iso(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp filters must be timezone-aware")
     return value.astimezone(IST).isoformat()
+
+
+def _session_iso_bounds(session_date: date) -> tuple[str, str]:
+    start = datetime.combine(session_date, time.min, tzinfo=IST)
+    return start.isoformat(), (start + timedelta(days=1)).isoformat()

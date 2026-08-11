@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -171,6 +172,82 @@ class MarketDataHealthMonitor:
             )
         )
 
+    def checkpoint_state(self) -> dict[str, object]:
+        """Return a JSON-safe state used by the incremental projection."""
+        return {
+            "version": 1,
+            "feed_epoch": self._epoch,
+            "states": [
+                {
+                    "exchange": state.exchange.value,
+                    "symbol_token": state.symbol_token,
+                    "epoch": state.epoch,
+                    "status": state.status.value,
+                    "latest_exchange": _optional_iso(state.latest_exchange),
+                    "latest_received": _optional_iso(state.latest_received),
+                    "sequence": state.sequence,
+                    "duplicates": state.duplicates,
+                    "out_of_order": state.out_of_order,
+                    "sequence_jumps": state.sequence_jumps,
+                    "recovery_ticks": state.recovery_ticks,
+                    "transition_at": state.transition_at.isoformat(),
+                }
+                for _, state in sorted(
+                    self._states.items(),
+                    key=lambda item: (item[0][0].value, item[0][1]),
+                )
+            ],
+        }
+
+    def restore_checkpoint_state(self, payload: Mapping[str, object]) -> None:
+        """Restore a previously validated checkpoint without replaying its prefix."""
+        if self._states or self._epoch:
+            raise ValueError("health monitor must be empty before checkpoint restore")
+        if payload.get("version") != 1:
+            raise ValueError("unsupported health checkpoint version")
+        epoch = _non_negative_int(payload.get("feed_epoch"), "feed_epoch")
+        raw_states = payload.get("states")
+        if not isinstance(raw_states, list):
+            raise ValueError("health checkpoint states must be a list")
+        restored: dict[tuple[Exchange, str], _State] = {}
+        for raw in raw_states:
+            if not isinstance(raw, Mapping):
+                raise ValueError("health checkpoint state must be an object")
+            exchange = Exchange(str(raw.get("exchange")))
+            symbol_token = str(raw.get("symbol_token", "")).strip()
+            if not symbol_token:
+                raise ValueError("health checkpoint token must not be blank")
+            key = (exchange, symbol_token)
+            if key in restored:
+                raise ValueError("health checkpoint contains duplicate instruments")
+            state_epoch = _non_negative_int(raw.get("epoch"), "epoch")
+            if state_epoch > epoch:
+                raise ValueError("instrument epoch is ahead of feed epoch")
+            restored[key] = _State(
+                exchange=exchange,
+                symbol_token=symbol_token,
+                epoch=state_epoch,
+                status=MarketDataHealthStatus(str(raw.get("status"))),
+                latest_exchange=_optional_datetime(raw.get("latest_exchange")),
+                latest_received=_optional_datetime(raw.get("latest_received")),
+                sequence=_optional_non_negative_int(raw.get("sequence"), "sequence"),
+                duplicates=_non_negative_int(raw.get("duplicates"), "duplicates"),
+                out_of_order=_non_negative_int(
+                    raw.get("out_of_order"), "out_of_order"
+                ),
+                sequence_jumps=_non_negative_int(
+                    raw.get("sequence_jumps"), "sequence_jumps"
+                ),
+                recovery_ticks=_non_negative_int(
+                    raw.get("recovery_ticks"), "recovery_ticks"
+                ),
+                transition_at=_required_datetime(
+                    raw.get("transition_at"), "transition_at"
+                ),
+            )
+        self._epoch = epoch
+        self._states = restored
+
     def _snapshot(self, state: _State, now: datetime) -> InstrumentHealth:
         age = None
         if state.latest_exchange is not None:
@@ -205,3 +282,30 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
     return value.astimezone(IST)
+
+
+def _optional_iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _required_datetime(value: object, field_name: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be an ISO timestamp")
+    try:
+        return _aware(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO timestamp") from exc
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    return None if value is None else _required_datetime(value, "timestamp")
+
+
+def _non_negative_int(value: object, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _optional_non_negative_int(value: object, field_name: str) -> int | None:
+    return None if value is None else _non_negative_int(value, field_name)

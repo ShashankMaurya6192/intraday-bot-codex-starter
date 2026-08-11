@@ -27,6 +27,18 @@ from .models import (
     SessionReference,
     TickAssessment,
 )
+from .projection import (
+    MarketIntelligenceProjection,
+    ProjectionCatchUpLimitExceeded,
+    ProjectionCheckpoint,
+    ProjectionCheckpointAheadError,
+    ProjectionCutoffBehindCheckpointError,
+    ProjectionError,
+    ProjectionStateCorruptError,
+    ProjectionUnavailableError,
+    ProjectionUpdate,
+    ProjectionView,
+)
 from .regime import MarketRegime, classify_market_regime
 from .replay import MarketReplayEngine, ReplayResult, ReplaySafetyLimitExceeded
 from .yfinance_history import (
@@ -51,12 +63,22 @@ __all__ = [
     "MarketDataHealthMonitor",
     "MarketDataHealthStatus",
     "MarketDataProvenance",
+    "MarketIntelligenceProjection",
     "MarketReplayEngine",
     "MarketRegime",
     "NSE_SESSION_CLOSE",
     "NSE_SESSION_OPEN",
     "SessionCandleAggregator",
     "SessionReference",
+    "ProjectionCatchUpLimitExceeded",
+    "ProjectionCheckpoint",
+    "ProjectionCheckpointAheadError",
+    "ProjectionCutoffBehindCheckpointError",
+    "ProjectionError",
+    "ProjectionStateCorruptError",
+    "ProjectionUnavailableError",
+    "ProjectionUpdate",
+    "ProjectionView",
     "ReplayResult",
     "ReplaySafetyLimitExceeded",
     "TickAssessment",

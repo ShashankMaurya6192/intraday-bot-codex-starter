@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "intraday-bot"
-version = "0.2.4"
+version = "0.2.5"
 description = "Paper-first Angel One market-data intelligence scanner"
 requires-python = ">=3.11"
 dependencies = [

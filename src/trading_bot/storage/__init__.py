@@ -7,10 +7,13 @@ from .ingestion import (
     TickQueueFullError,
     TickWriterError,
 )
+from .projection_writer import ProjectionMarketDataWriter, ProjectionWriterError
 from .sqlite import SQLiteMarketRecorder, sqlite_path_from_url
 
 __all__ = [
     "SQLiteMarketRecorder",
+    "ProjectionMarketDataWriter",
+    "ProjectionWriterError",
     "TickDrainTimeoutError",
     "TickIngestionError",
     "TickIngestionService",

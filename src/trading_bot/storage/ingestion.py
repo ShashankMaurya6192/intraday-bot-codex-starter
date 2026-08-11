@@ -9,7 +9,7 @@ from enum import StrEnum
 from queue import Empty, Full, Queue
 from typing import Protocol, cast
 
-from trading_bot.domain import MarketTick
+from trading_bot.domain import FeedEvent, MarketTick
 
 
 class TickBatchWriter(Protocol):
@@ -77,7 +77,9 @@ class TickIngestionService:
             )
 
         self._writer = writer
-        self._queue: Queue[MarketTick | object] = Queue(maxsize=queue_capacity)
+        self._queue: Queue[MarketTick | FeedEvent | object] = Queue(
+            maxsize=queue_capacity
+        )
         self._batch_size = batch_size
         self._flush_interval_seconds = flush_interval_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
@@ -125,6 +127,13 @@ class TickIngestionService:
 
     def submit(self, tick: MarketTick) -> None:
         """Queue one tick without blocking the broker callback."""
+        self._submit_item(tick)
+
+    def submit_feed_event(self, event: FeedEvent) -> None:
+        """Queue a feed event on the same FIFO path as scanner ticks."""
+        self._submit_item(event)
+
+    def _submit_item(self, item: MarketTick | FeedEvent) -> None:
         with self._state_lock:
             if self._state is not TickIngestionState.RUNNING or self._failure:
                 failure = self._failure
@@ -133,7 +142,7 @@ class TickIngestionService:
                 failure = None
                 state = self._state
                 try:
-                    self._queue.put_nowait(tick)
+                    self._queue.put_nowait(item)
                     return
                 except Full as exc:
                     queue_error = exc
@@ -219,10 +228,10 @@ class TickIngestionService:
                 if not batch:
                     continue
                 try:
-                    self._writer.record_ticks(batch)
+                    self._write_batch(batch)
                 except Exception as exc:
                     error = TickWriterError(
-                        "SQLite tick writer failed; ingestion is unsafe"
+                        "market-data writer failed; ingestion is unsafe"
                     )
                     self._mark_unhealthy(error, exc)
                     return
@@ -234,7 +243,7 @@ class TickIngestionService:
                 if self._state is TickIngestionState.DRAINING and self._failure is None:
                     self._state = TickIngestionState.STOPPED
 
-    def _take_batch(self) -> list[MarketTick]:
+    def _take_batch(self) -> list[MarketTick | FeedEvent]:
         try:
             first = self._queue.get(timeout=self._flush_interval_seconds)
         except Empty:
@@ -243,7 +252,7 @@ class TickIngestionService:
             self._queue.task_done()
             return []
 
-        batch = [cast(MarketTick, first)]
+        batch = [cast(MarketTick | FeedEvent, first)]
         deadline = self._monotonic_clock() + self._flush_interval_seconds
         while len(batch) < self._batch_size:
             if self._stop_requested.is_set():
@@ -257,8 +266,27 @@ class TickIngestionService:
             if item is _STOP_SIGNAL:
                 self._queue.task_done()
                 break
-            batch.append(cast(MarketTick, item))
+            batch.append(cast(MarketTick | FeedEvent, item))
         return batch
+
+    def _write_batch(self, batch: list[MarketTick | FeedEvent]) -> None:
+        pending_ticks: list[MarketTick] = []
+
+        def flush_ticks() -> None:
+            if pending_ticks:
+                self._writer.record_ticks(tuple(pending_ticks))
+                pending_ticks.clear()
+
+        for item in batch:
+            if isinstance(item, MarketTick):
+                pending_ticks.append(item)
+                continue
+            flush_ticks()
+            event_writer = getattr(self._writer, "record_feed_event", None)
+            if not callable(event_writer):
+                raise TypeError("batch writer does not support feed events")
+            event_writer(item)
+        flush_ticks()
 
     def _mark_unhealthy(
         self,

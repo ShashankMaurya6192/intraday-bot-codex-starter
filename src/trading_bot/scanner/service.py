@@ -107,6 +107,12 @@ class MarketScanner:
         | None = None,
         opening_range_references: Mapping[tuple[Exchange, str], SessionReference]
         | None = None,
+        state_source: str = "DIRECT_INPUT",
+        projection_age_seconds: float | None = None,
+        projection_load_seconds: float = 0.0,
+        incremental_ticks_processed: int = 0,
+        full_replay_used: bool = False,
+        projection_last_tick_id: int | None = None,
     ) -> ScannerResult:
         now_ist = _aware(now)
         session_references = session_references or {}
@@ -305,6 +311,12 @@ class MarketScanner:
             raw_ticks_replayed=raw_ticks_replayed,
             replay_elapsed_seconds=replay_elapsed_seconds,
             diagnostics=diagnostics,
+            state_source=state_source,
+            projection_age_seconds=projection_age_seconds,
+            projection_load_seconds=projection_load_seconds,
+            incremental_ticks_processed=incremental_ticks_processed,
+            full_replay_used=full_replay_used,
+            projection_last_tick_id=projection_last_tick_id,
         )
 
     def _indicator_values(
