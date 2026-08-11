@@ -12,6 +12,7 @@ from .history import (
     HistoricalBootstrapService,
     HistoricalBootstrapStatus,
     HistoricalDiagnosticResult,
+    HistoricalProviderDataset,
     HistoricalSymbolResult,
     aggregate_historical_five_minute,
     normalize_historical_response,
@@ -22,10 +23,19 @@ from .models import (
     CandleInterval,
     InstrumentHealth,
     MarketDataHealthStatus,
+    MarketDataProvenance,
+    SessionReference,
     TickAssessment,
 )
 from .regime import MarketRegime, classify_market_regime
 from .replay import MarketReplayEngine, ReplayResult, ReplaySafetyLimitExceeded
+from .yfinance_history import (
+    YFinanceDiagnosticResult,
+    YFinanceHistoricalProvider,
+    normalize_yfinance_frames,
+    yfinance_date_chunks,
+    yfinance_symbol,
+)
 
 __all__ = [
     "Candle",
@@ -36,21 +46,29 @@ __all__ = [
     "HistoricalBootstrapService",
     "HistoricalBootstrapStatus",
     "HistoricalDiagnosticResult",
+    "HistoricalProviderDataset",
     "HistoricalSymbolResult",
     "MarketDataHealthMonitor",
     "MarketDataHealthStatus",
+    "MarketDataProvenance",
     "MarketReplayEngine",
     "MarketRegime",
     "NSE_SESSION_CLOSE",
     "NSE_SESSION_OPEN",
     "SessionCandleAggregator",
+    "SessionReference",
     "ReplayResult",
     "ReplaySafetyLimitExceeded",
     "TickAssessment",
+    "YFinanceDiagnosticResult",
+    "YFinanceHistoricalProvider",
     "aggregate_historical_five_minute",
     "candle_start",
     "classify_market_regime",
     "normalize_historical_response",
+    "normalize_yfinance_frames",
     "run_historical_diagnostic",
     "session_close_for",
+    "yfinance_date_chunks",
+    "yfinance_symbol",
 ]

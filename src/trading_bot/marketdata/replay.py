@@ -11,7 +11,12 @@ from trading_bot.domain import IST, Exchange, FeedEvent, FeedEventType, MarketTi
 
 from .candles import SessionCandleAggregator
 from .health import MarketDataHealthMonitor
-from .models import Candle, CandleInterval, InstrumentHealth
+from .models import Candle, CandleInterval, InstrumentHealth, SessionReference
+from .recovery import (
+    SessionReferenceAccumulator,
+    opening_references_visible,
+    recover_first_five_minute_candles,
+)
 
 
 class ReplayStore(Protocol):
@@ -56,6 +61,8 @@ class ReplayResult:
     rejected_ticks: int
     raw_ticks_replayed: int
     ignored_future_ticks: int
+    session_references: tuple[SessionReference, ...] = ()
+    opening_range_references: tuple[SessionReference, ...] = ()
 
 
 class ReplaySafetyLimitExceeded(RuntimeError):
@@ -92,6 +99,7 @@ class MarketReplayEngine:
             recovery_consecutive_ticks=self._recovery_ticks,
         )
         aggregator = SessionCandleAggregator()
+        references = SessionReferenceAccumulator()
         candles: list[Candle] = []
         accepted = 0
         rejected = 0
@@ -131,6 +139,7 @@ class MarketReplayEngine:
                 rejected += 1
                 continue
             accepted += 1
+            references.observe(tick, trusted=assessment.trusted)
             candles.extend(aggregator.process(tick, trusted=assessment.trusted))
 
         while epoch_index < len(epoch_starts):
@@ -146,6 +155,11 @@ class MarketReplayEngine:
             health = monitor.all_health(now=health_at)
         else:
             health = ()
+        candles = recover_first_five_minute_candles(
+            candles,
+            references.before_first_five,
+            evaluation_at=cutoff,
+        )
         return ReplayResult(
             candles=tuple(
                 sorted(
@@ -163,6 +177,16 @@ class MarketReplayEngine:
             rejected_ticks=rejected,
             raw_ticks_replayed=len(ordered_ticks),
             ignored_future_ticks=len(ticks) - len(visible_ticks),
+            session_references=tuple(
+                sorted(
+                    references.latest.values(),
+                    key=lambda item: (item.exchange.value, item.symbol_token),
+                )
+            ),
+            opening_range_references=opening_references_visible(
+                references.before_opening_range,
+                evaluation_at=cutoff,
+            ),
         )
 
     def replay_date(

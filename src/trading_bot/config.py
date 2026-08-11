@@ -9,7 +9,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .domain import Exchange, MarketSubscription, SubscriptionMode, TradingMode
+from .domain import (
+    Exchange,
+    HistoricalProvider,
+    MarketSubscription,
+    SubscriptionMode,
+    TradingMode,
+)
 
 
 class Settings(BaseSettings):
@@ -62,6 +68,8 @@ class Settings(BaseSettings):
     nifty_benchmark_trading_symbol: str = "NIFTY 50"
     historical_bootstrap_lookback_days: int = Field(default=30, ge=22, le=30)
     historical_bootstrap_minimum_sessions: int = Field(default=15, ge=1, le=25)
+    historical_provider: HistoricalProvider = HistoricalProvider.ANGEL
+    historical_fallback_enabled: bool = False
     historical_request_delay_seconds: float = Field(default=0.5, ge=0.1, le=10)
     historical_request_max_attempts: int = Field(default=3, ge=1, le=5)
     historical_retry_initial_delay_seconds: float = Field(default=1.0, ge=0, le=60)

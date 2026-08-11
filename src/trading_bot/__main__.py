@@ -16,12 +16,13 @@ from .broker import (
     ReconnectPolicy,
 )
 from .config import Settings
-from .domain import IST, Exchange, MarketSubscription
+from .domain import IST, Exchange, HistoricalProvider, MarketSubscription
 from .marketdata import (
     Candle,
     HistoricalBootstrapService,
     MarketReplayEngine,
     ReplaySafetyLimitExceeded,
+    YFinanceHistoricalProvider,
     run_historical_diagnostic,
 )
 from .reference_data import (
@@ -79,7 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--json", action="store_true", dest="json_output")
     history = subparsers.add_parser(
         "bootstrap-history",
-        help="explicitly bootstrap prior 1m/5m research history from SmartAPI",
+        help="explicitly bootstrap prior 1m/5m research history",
     )
     history.add_argument("--force", action="store_true")
     history.add_argument("--json", action="store_true", dest="json_output")
@@ -90,6 +91,18 @@ def _parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--symbol", required=True)
     diagnostic.add_argument("--date", required=True, type=_iso_date)
     diagnostic.add_argument("--json", action="store_true", dest="json_output")
+    provider_diagnostic = subparsers.add_parser(
+        "test-history-provider",
+        help="validate a PAPER-only historical provider without writing data",
+    )
+    provider_diagnostic.add_argument(
+        "--provider",
+        required=True,
+        choices=[HistoricalProvider.YFINANCE.value],
+    )
+    provider_diagnostic.add_argument("--symbol", required=True)
+    provider_diagnostic.add_argument("--lookback-days", type=int, default=30)
+    provider_diagnostic.add_argument("--json", action="store_true", dest="json_output")
     scan = subparsers.add_parser(
         "scan", help="rank analysis-only LONG/SHORT attention candidates"
     )
@@ -109,11 +122,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.2")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.3")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
         print(f"Database={settings.database_url}")
+        print(f"Historical provider={settings.historical_provider.value}")
+        print(f"Historical fallback enabled={settings.historical_fallback_enabled}")
         print("Scanner output=ANALYSIS_ONLY")
         print("Paper execution available=False")
         print("Order placement available=False")
@@ -179,6 +194,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings,
             symbol=args.symbol,
             session_date=args.date,
+            json_output=args.json_output,
+        )
+
+    if command == "test-history-provider":
+        return _test_history_provider(
+            settings,
+            provider=HistoricalProvider(args.provider),
+            symbol=args.symbol,
+            lookback_days=args.lookback_days,
             json_output=args.json_output,
         )
 
@@ -306,8 +330,20 @@ def _bootstrap_history(
     )
     if benchmark is None or benchmark.instrument_type != "AMXIDX":
         raise RuntimeError("authoritative NIFTY benchmark mapping is unavailable")
-    _require_credentials(settings)
-    adapter = AngelOneMarketDataAdapter(_credentials(settings))
+    adapter = None
+    if settings.historical_provider in {
+        HistoricalProvider.ANGEL,
+        HistoricalProvider.AUTO,
+    }:
+        _require_credentials(settings)
+        adapter = AngelOneMarketDataAdapter(_credentials(settings))
+    fallback = (
+        YFinanceHistoricalProvider()
+        if settings.historical_fallback_enabled
+        and settings.historical_provider
+        in {HistoricalProvider.YFINANCE, HistoricalProvider.AUTO}
+        else None
+    )
     with _recorder(settings) as recorder:
         service = HistoricalBootstrapService(
             adapter,
@@ -320,6 +356,10 @@ def _bootstrap_history(
                 settings.historical_retry_initial_delay_seconds
             ),
             retry_max_delay_seconds=settings.historical_retry_max_delay_seconds,
+            provider=settings.historical_provider,
+            fallback_enabled=settings.historical_fallback_enabled,
+            fallback_provider=fallback,
+            trading_mode=settings.trading_mode,
         )
         result = service.bootstrap(
             mapped.instruments,
@@ -348,6 +388,7 @@ def _bootstrap_history(
                 f"  {item.symbol}: {item.status} sessions={item.sessions_found} "
                 f"cache_age_seconds={item.cache_age_seconds} "
                 f"reason_category={item.reason_category} reason={item.reason}"
+                f" provider={item.provider} provenance={item.provenance}"
             )
         if result.operator_action is not None:
             print(f"Operator action: {result.operator_action}")
@@ -398,6 +439,61 @@ def _test_historical(
     return 0 if result.successful else 2
 
 
+def _test_history_provider(
+    settings: Settings,
+    *,
+    provider: HistoricalProvider,
+    symbol: str,
+    lookback_days: int,
+    json_output: bool,
+) -> int:
+    if not 1 <= lookback_days <= 30:
+        raise ValueError("--lookback-days must be between 1 and 30")
+    if provider is not HistoricalProvider.YFINANCE:
+        raise ValueError("only the yfinance diagnostic is available in Phase 2.3")
+    now = datetime.now(IST)
+    instrument_cache = _instrument_cache(settings).load(now=now)
+    requested = symbol.strip().upper()
+    if requested in {"NIFTY", "NIFTY50", "NIFTY 50"}:
+        trading_symbol = settings.nifty_benchmark_trading_symbol
+    else:
+        trading_symbol = requested if requested.endswith("-EQ") else f"{requested}-EQ"
+    instrument = instrument_cache.find_trading_symbol(Exchange.NSE_CM, trading_symbol)
+    if instrument is None or not (
+        instrument.is_normal_nse_equity or instrument.instrument_type == "AMXIDX"
+    ):
+        raise RuntimeError(
+            "diagnostic symbol is unavailable in the authoritative instrument cache"
+        )
+    through_date = now.date() - timedelta(days=1)
+    from_date = through_date - timedelta(days=lookback_days - 1)
+    result = YFinanceHistoricalProvider().diagnose(
+        instrument=instrument,
+        from_date=from_date,
+        through_date=through_date,
+        minimum_sessions=settings.historical_bootstrap_minimum_sessions,
+    )
+    payload = result.to_dict()
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        discarded = ",".join(
+            item.isoformat() for item in result.discarded_partial_sessions
+        )
+        print(
+            "History provider diagnostic: "
+            f"status={result.status} provider={provider.value} "
+            f"symbol={result.symbol} provider_symbol={result.provider_symbol} "
+            f"chunks={result.requested_chunks} rows={result.row_count} "
+            f"complete_sessions={result.complete_sessions} "
+            f"discarded_partial_sessions={discarded} "
+            f"first={result.first_timestamp} last={result.last_timestamp} "
+            f"validation={result.validation} reason={result.reason} "
+            "order_placement_available=False"
+        )
+    return 0 if result.successful else 2
+
+
 def _data_status(settings: Settings, *, json_output: bool) -> int:
     now = datetime.now(IST)
     rows = [
@@ -436,6 +532,8 @@ def _replay(settings: Settings, session_date: date, *, json_output: bool) -> int
         "instruments": len(result.health),
         "raw_ticks_replayed": result.raw_ticks_replayed,
         "ignored_future_ticks": result.ignored_future_ticks,
+        "session_references": len(result.session_references),
+        "opening_range_references": len(result.opening_range_references),
     }
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -624,6 +722,14 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             raw_ticks_replayed=replay.raw_ticks_replayed,
             replay_elapsed_seconds=round(replay_elapsed, 6),
             scaling_warnings=scaling_warnings,
+            session_references={
+                (item.exchange, item.symbol_token): item
+                for item in replay.session_references
+            },
+            opening_range_references={
+                (item.exchange, item.symbol_token): item
+                for item in replay.opening_range_references
+            },
         )
     payload = result.to_dict()
     _print_scan_payload(payload, json_output=json_output, limit=limit)

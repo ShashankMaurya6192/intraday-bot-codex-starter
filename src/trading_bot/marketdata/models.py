@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import IntEnum, StrEnum
 
@@ -24,6 +24,13 @@ class CandleInterval(IntEnum):
     @property
     def label(self) -> str:
         return f"{int(self)}m"
+
+
+class MarketDataProvenance(StrEnum):
+    LOCAL_TICKS = "LOCAL_TICKS"
+    ANGEL_SESSION_FIELDS = "ANGEL_SESSION_FIELDS"
+    ANGEL_HISTORICAL = "ANGEL_HISTORICAL"
+    YFINANCE = "YFINANCE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,70 @@ class TickAssessment:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionReference:
+    """Validated as-of session fields carried by one trusted market tick."""
+
+    exchange: Exchange
+    symbol_token: str
+    trading_symbol: str | None
+    session_date: date
+    observed_at: datetime
+    session_open: Decimal
+    session_high: Decimal
+    session_low: Decimal
+    last_traded_price: Decimal
+    average_traded_price: Decimal | None
+    cumulative_volume: int | None
+    provenance: MarketDataProvenance
+    trusted: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "exchange", Exchange(self.exchange))
+        object.__setattr__(self, "provenance", MarketDataProvenance(self.provenance))
+        token = self.symbol_token.strip()
+        if not token:
+            raise ValueError("symbol_token must not be blank")
+        object.__setattr__(self, "symbol_token", token)
+        if self.trading_symbol is not None:
+            symbol = self.trading_symbol.strip().upper()
+            object.__setattr__(self, "trading_symbol", symbol or None)
+        observed_at = _aware(self.observed_at, "observed_at")
+        if observed_at.date() != self.session_date:
+            raise ValueError("session reference date does not match observed_at")
+        object.__setattr__(self, "observed_at", observed_at)
+        prices: dict[str, Decimal] = {}
+        for field_name in (
+            "session_open",
+            "session_high",
+            "session_low",
+            "last_traded_price",
+        ):
+            try:
+                value = Decimal(str(getattr(self, field_name)))
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError(f"{field_name} must be a decimal") from exc
+            if not value.is_finite() or value <= 0:
+                raise ValueError(f"{field_name} must be positive and finite")
+            prices[field_name] = value
+            object.__setattr__(self, field_name, value)
+        if prices["session_high"] < max(
+            prices["session_open"], prices["last_traded_price"]
+        ):
+            raise ValueError("session_high is inconsistent with session prices")
+        if prices["session_low"] > min(
+            prices["session_open"], prices["last_traded_price"]
+        ):
+            raise ValueError("session_low is inconsistent with session prices")
+        if self.average_traded_price is not None:
+            average = Decimal(str(self.average_traded_price))
+            if not average.is_finite() or average <= 0:
+                raise ValueError("average_traded_price must be positive and finite")
+            object.__setattr__(self, "average_traded_price", average)
+        if self.cumulative_volume is not None and self.cumulative_volume < 0:
+            raise ValueError("cumulative_volume must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class Candle:
     exchange: Exchange
     symbol_token: str
@@ -70,10 +141,12 @@ class Candle:
     tick_count: int
     completed: bool
     trusted: bool
+    provenance: MarketDataProvenance = MarketDataProvenance.LOCAL_TICKS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "exchange", Exchange(self.exchange))
         object.__setattr__(self, "interval", CandleInterval(self.interval))
+        object.__setattr__(self, "provenance", MarketDataProvenance(self.provenance))
         token = self.symbol_token.strip()
         if not token:
             raise ValueError("symbol_token must not be blank")

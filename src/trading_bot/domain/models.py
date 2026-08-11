@@ -17,6 +17,12 @@ class TradingMode(StrEnum):
     LIVE = "LIVE"
 
 
+class HistoricalProvider(StrEnum):
+    ANGEL = "angel"
+    YFINANCE = "yfinance"
+    AUTO = "auto"
+
+
 class Exchange(StrEnum):
     NSE_CM = "NSE_CM"
     NSE_FO = "NSE_FO"

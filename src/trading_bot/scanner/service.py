@@ -10,6 +10,8 @@ from typing import Protocol
 from trading_bot.broker import BrokerInstrument
 from trading_bot.domain import IST, Exchange
 from trading_bot.indicators import (
+    IndicatorResult,
+    OpeningRange,
     atr,
     cumulative_volume,
     ema,
@@ -24,6 +26,7 @@ from trading_bot.marketdata import (
     CandleInterval,
     InstrumentHealth,
     MarketRegime,
+    SessionReference,
     classify_market_regime,
 )
 
@@ -91,8 +94,14 @@ class MarketScanner:
         raw_ticks_replayed: int = 0,
         replay_elapsed_seconds: float = 0.0,
         scaling_warnings: Sequence[str] = (),
+        session_references: Mapping[tuple[Exchange, str], SessionReference]
+        | None = None,
+        opening_range_references: Mapping[tuple[Exchange, str], SessionReference]
+        | None = None,
     ) -> ScannerResult:
         now_ist = _aware(now)
+        session_references = session_references or {}
+        opening_range_references = opening_range_references or {}
         eligibility_diagnostics = list(expected_eligibility_diagnostics)
         reference_failures = list(reference_diagnostics)
         market_data_failures: list[str] = []
@@ -143,15 +152,30 @@ class MarketScanner:
         benchmark_has_session_open = _starts_at_session_open(
             benchmark_one_minute, now_ist.date()
         )
-        if benchmark is not None and not benchmark_has_session_open:
+        benchmark_reference = (
+            session_references.get(benchmark_key) if benchmark_key is not None else None
+        )
+        if (
+            benchmark is not None
+            and not benchmark_has_session_open
+            and benchmark_reference is None
+        ):
             benchmark_failures.append("nifty_benchmark_session_open_not_ready")
         benchmark_open = (
             benchmark_one_minute[0].open_price
             if benchmark_has_session_open
-            else None
+            else (
+                benchmark_reference.session_open
+                if benchmark_reference is not None
+                else None
+            )
         )
         benchmark_current = (
-            benchmark_one_minute[-1].close_price if benchmark_one_minute else None
+            benchmark_reference.last_traded_price
+            if benchmark_reference is not None
+            else (
+                benchmark_one_minute[-1].close_price if benchmark_one_minute else None
+            )
         )
 
         for instrument in sorted(instruments, key=lambda item: item.trading_symbol):
@@ -184,6 +208,9 @@ class MarketScanner:
                 benchmark_current=benchmark_current,
                 baseline_store=baseline_store,
                 session_date=now_ist.date(),
+                now=now_ist,
+                session_reference=session_references.get(key),
+                opening_range_reference=opening_range_references.get(key),
             )
             if isinstance(readiness, tuple):
                 rejected += 1
@@ -257,44 +284,112 @@ class MarketScanner:
         benchmark_current: Decimal | None,
         baseline_store: RelativeVolumeBaselineReader,
         session_date: date,
+        now: datetime,
+        session_reference: SessionReference | None,
+        opening_range_reference: SessionReference | None,
     ) -> dict[str, Decimal] | tuple[str, ...]:
         reasons: list[str] = []
-        if not one_minute or not rolling_five_minute:
+        if not rolling_five_minute:
             return ("completed_candles_missing",)
-        if not _starts_at_session_open(one_minute, session_date):
+        has_local_session_open = _starts_at_session_open(one_minute, session_date)
+        if not has_local_session_open and session_reference is None:
             reasons.append("session_open_not_ready")
         closes = [candle.close_price for candle in rolling_five_minute]
-        vwap_result = session_vwap(one_minute)
+        if has_local_session_open:
+            vwap_result = session_vwap(one_minute)
+        elif (
+            session_reference is not None
+            and session_reference.average_traded_price is not None
+        ):
+            vwap_result = IndicatorResult.ready_value(
+                session_reference.average_traded_price
+            )
+        else:
+            vwap_result = IndicatorResult[Decimal].not_ready(
+                "trusted session ATP is unavailable"
+            )
         ema9_result = ema(closes, 9)
         ema20_result = ema(closes, 20)
         atr_result = atr(rolling_five_minute, 14)
-        opening_result = opening_range(one_minute, minutes=self._opening_range_minutes)
-        latest = one_minute[-1]
+        if has_local_session_open:
+            opening_result = opening_range(
+                one_minute, minutes=self._opening_range_minutes
+            )
+        elif opening_range_reference is not None:
+            opening_result = IndicatorResult.ready_value(
+                OpeningRange(
+                    high=opening_range_reference.session_high,
+                    low=opening_range_reference.session_low,
+                )
+            )
+        else:
+            opening_result = IndicatorResult[OpeningRange].not_ready(
+                "trusted pre-09:30 session range is unavailable"
+            )
+        latest_price = (
+            session_reference.last_traded_price
+            if session_reference is not None
+            else (one_minute[-1].close_price if one_minute else None)
+        )
         session_open = datetime.combine(session_date, time(9, 15), tzinfo=IST)
-        minute_offset = int((latest.start_at - session_open).total_seconds() // 60)
-        baselines = baseline_store.load_rvol_baselines(
-            exchange=instrument.exchange,
-            symbol_token=instrument.symbol_token,
-            before_date=session_date,
-            minute_offset=minute_offset,
-            lookback_sessions=self._rvol_lookback,
+        latest_at = (
+            session_reference.observed_at
+            if session_reference is not None
+            else (one_minute[-1].start_at if one_minute else now)
         )
-        rvol_result = relative_volume(
-            cumulative_volume(one_minute),
-            baselines,
-            minimum_sessions=self._rvol_minimum,
+        minute_offset = int((latest_at - session_open).total_seconds() // 60)
+        if not 0 <= minute_offset <= 374:
+            rvol_result = IndicatorResult[Decimal].not_ready(
+                "current minute is outside the NSE session"
+            )
+        else:
+            baselines = baseline_store.load_rvol_baselines(
+                exchange=instrument.exchange,
+                symbol_token=instrument.symbol_token,
+                before_date=session_date,
+                minute_offset=minute_offset,
+                lookback_sessions=self._rvol_lookback,
+            )
+            current_volume = (
+                session_reference.cumulative_volume
+                if session_reference is not None
+                else (cumulative_volume(one_minute) if one_minute else None)
+            )
+            if current_volume is None:
+                rvol_result = IndicatorResult[Decimal].not_ready(
+                    "trusted cumulative volume is unavailable"
+                )
+            else:
+                rvol_result = relative_volume(
+                    current_volume,
+                    baselines,
+                    minimum_sessions=self._rvol_minimum,
+                )
+        stock_open = (
+            one_minute[0].open_price
+            if has_local_session_open
+            else (
+                session_reference.session_open
+                if session_reference is not None
+                else None
+            )
         )
-        if benchmark_open is None or benchmark_current is None:
+        if (
+            benchmark_open is None
+            or benchmark_current is None
+            or stock_open is None
+            or latest_price is None
+        ):
             strength_result = relative_strength(
                 stock_open=Decimal(0),
-                stock_current=latest.close_price,
+                stock_current=latest_price or Decimal(0),
                 benchmark_open=Decimal(0),
                 benchmark_current=Decimal(0),
             )
         else:
             strength_result = relative_strength(
-                stock_open=one_minute[0].open_price,
-                stock_current=latest.close_price,
+                stock_open=stock_open,
+                stock_current=latest_price,
                 benchmark_open=benchmark_open,
                 benchmark_current=benchmark_current,
             )
@@ -312,10 +407,12 @@ class MarketScanner:
         )
         if reasons:
             return tuple(reasons)
+        if latest_price is None:
+            return ("current_price_not_ready",)
         vwap_value = _required(vwap_result.value)
         atr_value = _required(atr_result.value)
         distance_result = vwap_distance(
-            price=latest.close_price,
+            price=latest_price,
             vwap=vwap_value,
             atr_value=atr_value,
         )
@@ -325,7 +422,7 @@ class MarketScanner:
         if opening_value is None:
             return ("opening_range_not_ready",)
         return {
-            "ltp": latest.close_price,
+            "ltp": latest_price,
             "vwap": vwap_value,
             "vwap_distance_pct": distance_result.value.percentage,
             "vwap_distance_atr": distance_result.value.atr_units,
@@ -440,7 +537,14 @@ def _interval(
 
 def _starts_at_session_open(candles: Sequence[Candle], session_date: date) -> bool:
     expected = datetime.combine(session_date, time(9, 15), tzinfo=IST)
-    return bool(candles) and candles[0].start_at == expected
+    return (
+        bool(candles)
+        and candles[0].start_at == expected
+        and all(
+            current.end_at == following.start_at
+            for current, following in zip(candles[:-1], candles[1:], strict=True)
+        )
+    )
 
 
 def _required(value: Decimal | None) -> Decimal:

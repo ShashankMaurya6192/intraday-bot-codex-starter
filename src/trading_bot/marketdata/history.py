@@ -19,10 +19,10 @@ from trading_bot.broker import (
     BrokerHistoricalTransportError,
     BrokerInstrument,
 )
-from trading_bot.domain import IST, Exchange
+from trading_bot.domain import IST, Exchange, HistoricalProvider, TradingMode
 
 from .candles import NSE_SESSION_CLOSE, NSE_SESSION_OPEN
-from .models import Candle, CandleInterval
+from .models import Candle, CandleInterval, MarketDataProvenance
 
 
 class HistoricalBootstrapError(RuntimeError):
@@ -63,6 +63,8 @@ class HistoricalBootstrapStatus:
     one_minute_candles: int
     five_minute_candles: int
     source_sha256: str
+    provider: str = HistoricalProvider.ANGEL.value
+    provenance: MarketDataProvenance = MarketDataProvenance.ANGEL_HISTORICAL
 
     @property
     def cache_age_seconds(self) -> float:
@@ -86,7 +88,32 @@ class HistoricalBootstrapStore(Protocol):
         fetched_at: datetime,
         source_sha256: str,
         build_rvol_baselines: bool,
+        provider: str = HistoricalProvider.ANGEL.value,
+        provenance: MarketDataProvenance = MarketDataProvenance.ANGEL_HISTORICAL,
     ) -> HistoricalBootstrapStatus: ...
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalProviderDataset:
+    provider: HistoricalProvider
+    provenance: MarketDataProvenance
+    one_minute_candles: tuple[Candle, ...]
+    complete_session_dates: tuple[date, ...]
+    source_sha256: str
+    requested_chunks: int
+    raw_rows: int
+    discarded_partial_sessions: tuple[date, ...] = ()
+
+
+class HistoricalFallbackProvider(Protocol):
+    def fetch(
+        self,
+        *,
+        instrument: BrokerInstrument,
+        from_date: date,
+        through_date: date,
+        minimum_sessions: int,
+    ) -> HistoricalProviderDataset: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +124,8 @@ class HistoricalSymbolResult:
     cache_age_seconds: float | None
     reason_category: str | None = None
     reason: str | None = None
+    provider: str | None = None
+    provenance: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +135,8 @@ class HistoricalSymbolResult:
             "cache_age_seconds": self.cache_age_seconds,
             "reason_category": self.reason_category,
             "reason": self.reason,
+            "provider": self.provider,
+            "provenance": self.provenance,
         }
 
 
@@ -122,6 +153,7 @@ class HistoricalBootstrapResult:
     reason_category: str | None
     operator_action: str | None
     symbols: tuple[HistoricalSymbolResult, ...]
+    fallback_used: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -136,6 +168,7 @@ class HistoricalBootstrapResult:
             "reason_category": self.reason_category,
             "operator_action": self.operator_action,
             "symbols": [item.to_dict() for item in self.symbols],
+            "fallback_used": self.fallback_used,
             "order_placement_available": False,
         }
 
@@ -180,7 +213,7 @@ class HistoricalBootstrapService:
 
     def __init__(
         self,
-        broker: HistoricalDataBroker,
+        broker: HistoricalDataBroker | None,
         store: HistoricalBootstrapStore,
         *,
         lookback_days: int = 30,
@@ -190,6 +223,10 @@ class HistoricalBootstrapService:
         retry_initial_delay_seconds: float = 1.0,
         retry_max_delay_seconds: float = 8.0,
         sleeper=time.sleep,
+        provider: HistoricalProvider = HistoricalProvider.ANGEL,
+        fallback_enabled: bool = False,
+        fallback_provider: HistoricalFallbackProvider | None = None,
+        trading_mode: TradingMode = TradingMode.PAPER,
     ) -> None:
         if not 22 <= lookback_days <= 30:
             raise ValueError("historical lookback must be between 22 and 30 days")
@@ -201,6 +238,21 @@ class HistoricalBootstrapService:
             raise ValueError("historical max attempts must be positive")
         if retry_initial_delay_seconds > retry_max_delay_seconds:
             raise ValueError("historical retry delay bounds are invalid")
+        provider = HistoricalProvider(provider)
+        trading_mode = TradingMode(trading_mode)
+        if provider is HistoricalProvider.ANGEL and broker is None:
+            raise ValueError("Angel historical provider requires a broker adapter")
+        if provider is HistoricalProvider.YFINANCE and not fallback_enabled:
+            raise ValueError("yfinance history requires explicit fallback opt-in")
+        if provider is HistoricalProvider.AUTO and broker is None:
+            raise ValueError("automatic history requires an Angel broker adapter")
+        if provider is HistoricalProvider.YFINANCE or (
+            provider is HistoricalProvider.AUTO and fallback_enabled
+        ):
+            if fallback_provider is None:
+                raise ValueError("configured yfinance history provider is unavailable")
+            if trading_mode is not TradingMode.PAPER:
+                raise ValueError("yfinance history is PAPER-only")
         self._broker = broker
         self._store = store
         self._lookback_days = lookback_days
@@ -210,6 +262,10 @@ class HistoricalBootstrapService:
         self._retry_initial = retry_initial_delay_seconds
         self._retry_max = retry_max_delay_seconds
         self._sleeper = sleeper
+        self._provider = provider
+        self._fallback_enabled = fallback_enabled
+        self._fallback_provider = fallback_provider
+        self._trading_mode = trading_mode
 
     def bootstrap(
         self,
@@ -235,6 +291,9 @@ class HistoricalBootstrapService:
         from_date = through_date - timedelta(days=self._lookback_days - 1)
         results: list[HistoricalSymbolResult] = []
         request_number = 0
+        angel_throttled = self._provider is HistoricalProvider.YFINANCE
+        fallback_used = self._provider is HistoricalProvider.YFINANCE
+        fallback_trigger_symbol: str | None = None
         for instrument_index, instrument in enumerate(all_instruments):
             previous = self._store.load_historical_bootstrap_status(
                 exchange=instrument.exchange,
@@ -255,46 +314,71 @@ class HistoricalBootstrapService:
                         cache_age_seconds=max(
                             0.0, (now_ist - previous.fetched_at).total_seconds()
                         ),
+                        provider=previous.provider,
+                        provenance=previous.provenance.value,
                     )
                 )
                 continue
             try:
-                responses: list[Mapping[str, object]] = []
-                for chunk_start, chunk_end in _historical_date_chunks(
-                    from_date, through_date
-                ):
-                    if request_number:
-                        self._sleeper(self._request_delay)
-                    request_number += 1
-                    parameters = _historical_parameters(
-                        instrument, chunk_start, chunk_end
-                    )
-                    responses.append(self._fetch_with_retries(parameters))
-                response = _combine_historical_responses(responses)
-                one_minute, session_dates = normalize_historical_response(
-                    response,
-                    instrument=instrument,
-                    minimum_sessions=self._minimum_sessions,
+                use_fallback = (
+                    self._provider is HistoricalProvider.YFINANCE or angel_throttled
                 )
-                five_minute = aggregate_historical_five_minute(one_minute)
-                source_sha256 = hashlib.sha256(
-                    json.dumps(
-                        responses,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ).encode("utf-8")
-                ).hexdigest()
+                if use_fallback:
+                    dataset = self._fetch_fallback(
+                        instrument=instrument,
+                        from_date=from_date,
+                        through_date=through_date,
+                    )
+                    fallback_used = True
+                else:
+                    responses: list[Mapping[str, object]] = []
+                    for chunk_start, chunk_end in _historical_date_chunks(
+                        from_date, through_date
+                    ):
+                        if request_number:
+                            self._sleeper(self._request_delay)
+                        request_number += 1
+                        parameters = _historical_parameters(
+                            instrument, chunk_start, chunk_end
+                        )
+                        responses.append(self._fetch_with_retries(parameters))
+                    response = _combine_historical_responses(responses)
+                    one_minute, session_dates = normalize_historical_response(
+                        response,
+                        instrument=instrument,
+                        minimum_sessions=self._minimum_sessions,
+                    )
+                    dataset = HistoricalProviderDataset(
+                        provider=HistoricalProvider.ANGEL,
+                        provenance=MarketDataProvenance.ANGEL_HISTORICAL,
+                        one_minute_candles=one_minute,
+                        complete_session_dates=session_dates,
+                        source_sha256=hashlib.sha256(
+                            json.dumps(
+                                responses,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                        requested_chunks=len(responses),
+                        raw_rows=len(response.get("data") or ()),
+                    )
+                five_minute = aggregate_historical_five_minute(
+                    dataset.one_minute_candles
+                )
                 status = self._store.replace_historical_dataset(
                     instrument=instrument,
-                    one_minute_candles=one_minute,
+                    one_minute_candles=dataset.one_minute_candles,
                     five_minute_candles=five_minute,
-                    complete_session_dates=session_dates,
+                    complete_session_dates=dataset.complete_session_dates,
                     from_date=from_date,
                     through_date=through_date,
                     fetched_at=now_ist,
-                    source_sha256=source_sha256,
+                    source_sha256=dataset.source_sha256,
                     build_rvol_baselines=instrument.instrument_type != "AMXIDX",
+                    provider=dataset.provider.value,
+                    provenance=dataset.provenance,
                 )
                 results.append(
                     HistoricalSymbolResult(
@@ -302,9 +386,75 @@ class HistoricalBootstrapService:
                         status="COMPLETED",
                         sessions_found=status.sessions_found,
                         cache_age_seconds=0.0,
+                        provider=status.provider,
+                        provenance=status.provenance.value,
                     )
                 )
             except BrokerHistoricalRateLimitError as exc:
+                if (
+                    self._provider is HistoricalProvider.AUTO
+                    and self._fallback_enabled
+                    and self._trading_mode is TradingMode.PAPER
+                ):
+                    angel_throttled = True
+                    fallback_used = True
+                    fallback_trigger_symbol = instrument.trading_symbol
+                    try:
+                        dataset = self._fetch_fallback(
+                            instrument=instrument,
+                            from_date=from_date,
+                            through_date=through_date,
+                        )
+                        five_minute = aggregate_historical_five_minute(
+                            dataset.one_minute_candles
+                        )
+                        status = self._store.replace_historical_dataset(
+                            instrument=instrument,
+                            one_minute_candles=dataset.one_minute_candles,
+                            five_minute_candles=five_minute,
+                            complete_session_dates=dataset.complete_session_dates,
+                            from_date=from_date,
+                            through_date=through_date,
+                            fetched_at=now_ist,
+                            source_sha256=dataset.source_sha256,
+                            build_rvol_baselines=(
+                                instrument.instrument_type != "AMXIDX"
+                            ),
+                            provider=dataset.provider.value,
+                            provenance=dataset.provenance,
+                        )
+                        results.append(
+                            HistoricalSymbolResult(
+                                symbol=instrument.trading_symbol,
+                                status="COMPLETED",
+                                sessions_found=status.sessions_found,
+                                cache_age_seconds=0.0,
+                                provider=status.provider,
+                                provenance=status.provenance.value,
+                            )
+                        )
+                    except Exception as fallback_exc:
+                        results.append(
+                            HistoricalSymbolResult(
+                                symbol=instrument.trading_symbol,
+                                status="FAILED",
+                                sessions_found=(
+                                    previous.sessions_found if previous else 0
+                                ),
+                                cache_age_seconds=(
+                                    max(
+                                        0.0,
+                                        (now_ist - previous.fetched_at).total_seconds(),
+                                    )
+                                    if previous
+                                    else None
+                                ),
+                                reason_category=_failure_category(fallback_exc),
+                                reason=_safe_failure_reason(fallback_exc),
+                                provider=HistoricalProvider.YFINANCE.value,
+                            )
+                        )
+                    continue
                 results.append(
                     HistoricalSymbolResult(
                         symbol=instrument.trading_symbol,
@@ -331,6 +481,7 @@ class HistoricalBootstrapService:
                         "reset, then rerun the same command. Completed symbols "
                         "will be skipped unless --force is supplied."
                     ),
+                    fallback_used=fallback_used,
                 )
             except BrokerAuthenticationError:
                 raise
@@ -356,14 +507,34 @@ class HistoricalBootstrapService:
             status=(
                 "COMPLETED_WITH_FAILURES"
                 if any(item.status == "FAILED" for item in results)
-                else "COMPLETED"
+                else ("COMPLETED_WITH_FALLBACK" if fallback_used else "COMPLETED")
             ),
+            fallback_used=fallback_used,
+            rate_limited_symbol=fallback_trigger_symbol,
+        )
+
+    def _fetch_fallback(
+        self,
+        *,
+        instrument: BrokerInstrument,
+        from_date: date,
+        through_date: date,
+    ) -> HistoricalProviderDataset:
+        if self._fallback_provider is None:
+            raise HistoricalBootstrapError("historical fallback is unavailable")
+        return self._fallback_provider.fetch(
+            instrument=instrument,
+            from_date=from_date,
+            through_date=through_date,
+            minimum_sessions=self._minimum_sessions,
         )
 
     def _fetch_with_retries(
         self, parameters: Mapping[str, object]
     ) -> Mapping[str, object]:
         last_error: Exception | None = None
+        if self._broker is None:
+            raise HistoricalBootstrapError("Angel historical broker is unavailable")
         for attempt in range(1, self._max_attempts + 1):
             try:
                 response = self._broker.fetch_historical_candles(parameters)
@@ -404,8 +575,7 @@ class HistoricalBootstrapService:
                 ) from exc
         detail = _safe_failure_reason(last_error) if last_error else "unknown"
         raise BrokerHistoricalTransportError(
-            f"historical transport failed after {self._max_attempts} attempts: "
-            f"{detail}"
+            f"historical transport failed after {self._max_attempts} attempts: {detail}"
         ) from last_error
 
 
@@ -476,9 +646,7 @@ def run_historical_diagnostic(
             else "BROKER_RESPONSE_ERROR"
         )
         return HistoricalDiagnosticResult(
-            status=(
-                "ABORTED_RATE_LIMIT" if category == "RATE_LIMITED" else "REJECTED"
-            ),
+            status=("ABORTED_RATE_LIMIT" if category == "RATE_LIMITED" else "REJECTED"),
             symbol=instrument.trading_symbol,
             session_date=session_date,
             broker_status=broker_status,
@@ -556,11 +724,10 @@ def _bootstrap_result(
     rate_limited_symbol: str | None = None,
     reason_category: str | None = None,
     operator_action: str | None = None,
+    fallback_used: bool = False,
 ) -> HistoricalBootstrapResult:
     completed = tuple(
-        item
-        for item in results
-        if item.status in {"COMPLETED", "SKIPPED_CURRENT"}
+        item for item in results if item.status in {"COMPLETED", "SKIPPED_CURRENT"}
     )
     failed = tuple(
         item for item in results if item.status in {"FAILED", "RATE_LIMITED"}
@@ -582,6 +749,7 @@ def _bootstrap_result(
         reason_category=reason_category,
         operator_action=operator_action,
         symbols=tuple(results),
+        fallback_used=fallback_used,
     )
 
 
@@ -630,8 +798,7 @@ def _safe_broker_status(value: object) -> object | None:
 def _looks_rate_limited(message: str, error_code: str) -> bool:
     normalized = message.lower()
     return any(marker in normalized for marker in _RATE_LIMIT_MARKERS) or (
-        error_code.strip().upper()
-        in {"429", "RATE_LIMITED", "TOO_MANY_REQUESTS"}
+        error_code.strip().upper() in {"429", "RATE_LIMITED", "TOO_MANY_REQUESTS"}
     )
 
 
@@ -720,6 +887,7 @@ def normalize_historical_response(
                 tick_count=1,
                 completed=True,
                 trusted=True,
+                provenance=MarketDataProvenance.ANGEL_HISTORICAL,
             )
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise HistoricalBootstrapError(
@@ -775,9 +943,7 @@ def aggregate_historical_five_minute(
             candle
         )
     result: list[Candle] = []
-    for (_, _, start_at), items in sorted(
-        grouped.items(), key=lambda item: item[0][2]
-    ):
+    for (_, _, start_at), items in sorted(grouped.items(), key=lambda item: item[0][2]):
         items.sort(key=lambda item: item.start_at)
         if len(items) != 5 or any(
             current.end_at != following.start_at
@@ -802,6 +968,7 @@ def aggregate_historical_five_minute(
                 tick_count=sum(item.tick_count for item in items),
                 completed=True,
                 trusted=True,
+                provenance=items[0].provenance,
             )
         )
     return tuple(result)

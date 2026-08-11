@@ -17,10 +17,11 @@ from trading_bot.domain import (
     Exchange,
     FeedEvent,
     FeedEventType,
+    HistoricalProvider,
     MarketTick,
     SubscriptionMode,
 )
-from trading_bot.marketdata import Candle, CandleInterval
+from trading_bot.marketdata import Candle, CandleInterval, MarketDataProvenance
 from trading_bot.marketdata.history import HistoricalBootstrapStatus
 
 _SCHEMA = """
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS market_candles (
     tick_count INTEGER NOT NULL CHECK (tick_count > 0),
     completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
     trusted INTEGER NOT NULL CHECK (trusted IN (0, 1)),
+    provenance TEXT NOT NULL DEFAULT 'LOCAL_TICKS',
     UNIQUE (exchange, symbol_token, interval_minutes, start_at)
 );
 
@@ -115,6 +117,8 @@ CREATE TABLE IF NOT EXISTS historical_bootstrap_status (
     one_minute_candles INTEGER NOT NULL CHECK (one_minute_candles > 0),
     five_minute_candles INTEGER NOT NULL CHECK (five_minute_candles > 0),
     source_sha256 TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'angel',
+    provenance TEXT NOT NULL DEFAULT 'ANGEL_HISTORICAL',
     PRIMARY KEY (exchange, symbol_token)
 );
 """
@@ -145,6 +149,39 @@ class SQLiteMarketRecorder:
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
             self._connection.executescript(_SCHEMA)
+            _ensure_column(
+                self._connection,
+                table="market_candles",
+                column="provenance",
+                definition="TEXT NOT NULL DEFAULT 'LOCAL_TICKS'",
+            )
+            _ensure_column(
+                self._connection,
+                table="historical_bootstrap_status",
+                column="provider",
+                definition="TEXT NOT NULL DEFAULT 'angel'",
+            )
+            _ensure_column(
+                self._connection,
+                table="historical_bootstrap_status",
+                column="provenance",
+                definition="TEXT NOT NULL DEFAULT 'ANGEL_HISTORICAL'",
+            )
+            self._connection.execute(
+                """
+                UPDATE market_candles
+                SET provenance = 'ANGEL_HISTORICAL'
+                WHERE provenance = 'LOCAL_TICKS'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM historical_bootstrap_status AS history
+                    WHERE history.exchange = market_candles.exchange
+                      AND history.symbol_token = market_candles.symbol_token
+                      AND date(market_candles.start_at) >= history.from_date
+                      AND date(market_candles.start_at) <= history.through_date
+                  )
+                """
+            )
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO schema_version(version, applied_at)
@@ -165,6 +202,13 @@ class SQLiteMarketRecorder:
                 VALUES (?, ?)
                 """,
                 (3, datetime.now(IST).isoformat()),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_version(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (4, datetime.now(IST).isoformat()),
             )
             self._connection.commit()
 
@@ -408,6 +452,8 @@ class SQLiteMarketRecorder:
             one_minute_candles=row["one_minute_candles"],
             five_minute_candles=row["five_minute_candles"],
             source_sha256=row["source_sha256"],
+            provider=row["provider"],
+            provenance=MarketDataProvenance(row["provenance"]),
         )
 
     def replace_historical_dataset(
@@ -422,10 +468,23 @@ class SQLiteMarketRecorder:
         fetched_at: datetime,
         source_sha256: str,
         build_rvol_baselines: bool,
+        provider: str = "angel",
+        provenance: MarketDataProvenance = MarketDataProvenance.ANGEL_HISTORICAL,
     ) -> HistoricalBootstrapStatus:
         """Atomically replace one fully validated broker-history dataset."""
         if not one_minute_candles or not five_minute_candles:
             raise ValueError("historical dataset must contain 1m and 5m candles")
+        actual_provider = HistoricalProvider(provider)
+        if actual_provider is HistoricalProvider.AUTO:
+            raise ValueError("persisted historical provider must be concrete")
+        provenance = MarketDataProvenance(provenance)
+        expected_provenance = (
+            MarketDataProvenance.YFINANCE
+            if actual_provider is HistoricalProvider.YFINANCE
+            else MarketDataProvenance.ANGEL_HISTORICAL
+        )
+        if provenance is not expected_provenance:
+            raise ValueError("historical provider/provenance are inconsistent")
         if not complete_session_dates or from_date > through_date:
             raise ValueError("historical session/date bounds are invalid")
         if len(source_sha256) != 64 or any(
@@ -444,6 +503,7 @@ class SQLiteMarketRecorder:
                 or candle.start_at.date() not in session_dates
                 or not candle.completed
                 or not candle.trusted
+                or candle.provenance is not provenance
             ):
                 raise ValueError("historical candle identity/trust is inconsistent")
         range_start = datetime.combine(from_date, time.min, tzinfo=IST).isoformat()
@@ -516,8 +576,9 @@ class SQLiteMarketRecorder:
                 INSERT INTO historical_bootstrap_status(
                     exchange, symbol_token, trading_symbol, from_date,
                     through_date, fetched_at, sessions_found,
-                    one_minute_candles, five_minute_candles, source_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    one_minute_candles, five_minute_candles, source_sha256,
+                    provider, provenance
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exchange, symbol_token) DO UPDATE SET
                     trading_symbol = excluded.trading_symbol,
                     from_date = excluded.from_date,
@@ -526,7 +587,9 @@ class SQLiteMarketRecorder:
                     sessions_found = excluded.sessions_found,
                     one_minute_candles = excluded.one_minute_candles,
                     five_minute_candles = excluded.five_minute_candles,
-                    source_sha256 = excluded.source_sha256
+                    source_sha256 = excluded.source_sha256,
+                    provider = excluded.provider,
+                    provenance = excluded.provenance
                 """,
                 (
                     instrument.exchange.value,
@@ -539,6 +602,8 @@ class SQLiteMarketRecorder:
                     len(one_minute_candles),
                     len(five_minute_candles),
                     source_sha256.lower(),
+                    actual_provider.value,
+                    provenance.value,
                 ),
             )
         status = self.load_historical_bootstrap_status(
@@ -643,11 +708,34 @@ INSERT OR IGNORE INTO market_ticks(
 """
 
 _INSERT_CANDLE = """
-INSERT OR IGNORE INTO market_candles(
+INSERT INTO market_candles(
     exchange, symbol_token, trading_symbol, interval_minutes,
     start_at, end_at, open_price, high_price, low_price, close_price,
-    volume, tick_count, completed, trusted
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    volume, tick_count, completed, trusted, provenance
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(exchange, symbol_token, interval_minutes, start_at) DO UPDATE SET
+    trading_symbol = excluded.trading_symbol,
+    end_at = excluded.end_at,
+    open_price = excluded.open_price,
+    high_price = excluded.high_price,
+    low_price = excluded.low_price,
+    close_price = excluded.close_price,
+    volume = excluded.volume,
+    tick_count = excluded.tick_count,
+    completed = excluded.completed,
+    trusted = excluded.trusted,
+    provenance = excluded.provenance
+WHERE market_candles.trading_symbol IS NOT excluded.trading_symbol
+   OR market_candles.end_at IS NOT excluded.end_at
+   OR market_candles.open_price IS NOT excluded.open_price
+   OR market_candles.high_price IS NOT excluded.high_price
+   OR market_candles.low_price IS NOT excluded.low_price
+   OR market_candles.close_price IS NOT excluded.close_price
+   OR market_candles.volume IS NOT excluded.volume
+   OR market_candles.tick_count IS NOT excluded.tick_count
+   OR market_candles.completed IS NOT excluded.completed
+   OR market_candles.trusted IS NOT excluded.trusted
+   OR market_candles.provenance IS NOT excluded.provenance
 """
 
 
@@ -715,6 +803,7 @@ def _candle_values(candle: Candle) -> tuple[object, ...]:
         candle.tick_count,
         int(candle.completed),
         int(candle.trusted),
+        candle.provenance.value,
     )
 
 
@@ -734,7 +823,22 @@ def _row_to_candle(row: sqlite3.Row) -> Candle:
         tick_count=row["tick_count"],
         completed=bool(row["completed"]),
         trusted=bool(row["trusted"]),
+        provenance=MarketDataProvenance(row["provenance"]),
     )
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    existing = {
+        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    if column not in existing:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _optional_decimal_string(value: Decimal | None) -> str | None:

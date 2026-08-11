@@ -3,10 +3,10 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.2 adds fail-safe SmartAPI Historical API throttling, a one-request
-historical diagnostic, bounded historical batching, and restartable batch
-outcomes to the Phase 2.1 market-intelligence implementation. Scanner results
-are analysis only.
+Phase 2.3 adds causal same-day recovery from trusted SmartAPI session fields and
+an explicit PAPER-only yfinance fallback for research history. It builds on the
+Phase 2.2 fail-safe Historical API throttling and Phase 2.1 market-intelligence
+correctness gates. Scanner results are analysis only.
 There is no paper execution, order interface, or live order-placement code.
 
 ## Safety status
@@ -22,8 +22,11 @@ There is no paper execution, order interface, or live order-placement code.
 - Reconnects, downloads, queues, and shutdown drains are bounded.
 - Missing, stale, corrupt, ambiguous, timestamp-disordered, or incomplete data
   suppresses scanner readiness.
-- A Historical API rate-limit response aborts the whole bootstrap immediately;
-  it is never retried as a transient error and never advances to another symbol.
+- With the default `HISTORICAL_PROVIDER=angel`, a Historical API rate-limit
+  response aborts the whole bootstrap immediately; it is never retried as a
+  transient error and never advances to another symbol.
+- A yfinance continuation is possible only in PAPER mode when the operator sets
+  both `HISTORICAL_PROVIDER=auto` and `HISTORICAL_FALLBACK_ENABLED=true`.
 - Angel may throttle the Historical API independently while normal login and
   live WebSocket market data remain healthy.
 
@@ -47,6 +50,8 @@ Keep these values unchanged:
 ```dotenv
 TRADING_MODE=PAPER
 LIVE_TRADING_ENABLED=false
+HISTORICAL_PROVIDER=angel
+HISTORICAL_FALLBACK_ENABLED=false
 ```
 
 Populate credentials only in the local `.env` file:
@@ -192,6 +197,16 @@ python -m trading_bot test-historical --symbol SBIN --date 2026-08-07
 python -m trading_bot test-historical --symbol SBIN --date 2026-08-07 --json
 ```
 
+To diagnose the optional yfinance path without writing SQLite, use the exact
+PAPER-only command below. It reports the provider symbol, chunk/row counts,
+complete and discarded-partial sessions, first/last timestamp, validation, and
+the disabled order capability:
+
+```powershell
+python -m trading_bot test-history-provider --provider yfinance --symbol SBIN --lookback-days 30
+python -m trading_bot test-history-provider --provider yfinance --symbol SBIN --lookback-days 30 --json
+```
+
 The diagnostic authenticates normally, resolves `SBIN-EQ` only from the fresh
 local Angel instrument cache, and prints broker status, message, error code, row
 count, and first/last timestamp. It never prints the symbol token, credentials,
@@ -227,6 +242,28 @@ Previously completed atomic writes remain valid, the throttled symbol retains
 any older valid dataset, and a normal rerun skips completed symbols before
 resuming.
 
+Angel remains the primary historical provider. The default configuration never
+contacts yfinance. To permit a PAPER-mode bootstrap to continue through
+yfinance after the first Angel throttle, set these values explicitly:
+
+```dotenv
+TRADING_MODE=PAPER
+HISTORICAL_PROVIDER=auto
+HISTORICAL_FALLBACK_ENABLED=true
+```
+
+After that first throttle, the run makes no further Angel historical requests.
+It validates each yfinance row, maps `FOO-EQ` to `FOO.NS` and NIFTY 50 to
+`^NSEI`, downloads deterministic chunks of at most seven calendar days,
+normalizes timestamps to `Asia/Kolkata`, discards individual partial sessions,
+and accepts only complete 375-minute regular NSE sessions. Only then does it use
+the same canonical five-minute/RVOL persistence path. A symbol is replaced only
+after the configured minimum complete-session count passes. Provider and
+provenance are persisted in bootstrap status. Direct
+`HISTORICAL_PROVIDER=yfinance` also requires
+`HISTORICAL_FALLBACK_ENABLED=true`; all yfinance bootstrap use is rejected in
+LIVE mode. This is a research fallback, not an executable market-data source.
+
 `record-scanner-market` remains usable while historical bootstrap is
 broker-throttled because its WebSocket path is independent. Until enough prior
 history is available, scanner EMA/ATR/RVOL warm-ups may remain incomplete and
@@ -253,7 +290,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2 architecture
+## Phase 2.3 architecture
 
 ```text
 explicit refresh commands
@@ -261,13 +298,13 @@ explicit refresh commands
 
 explicit SmartAPI historical diagnostic/bootstrap
   -> distinct throttle/rejection/transport failure categories
-  -> immediate global abort on broker throttling
+  -> default global abort, or explicit PAPER-only yfinance continuation
   -> validated complete 1m sessions
-  -> local 5m warm-up candles + equity-only RVOL baselines
+  -> provider/provenance status + local 5m/RVOL derivation
 
 recorded SmartAPI ticks
   -> feed-epoch health monitor + sequence telemetry
-  -> deterministic 09:15 IST candle aggregation
+  -> causal session references + deterministic 09:15 IST candle aggregation
   -> idempotent SQLite candles + complete-session RVOL baselines
   -> replay-safe indicators + NIFTY regime
   -> explainable analysis-only scanner rankings
@@ -318,6 +355,24 @@ telemetry, and require three consecutive valid fresh ticks by default before
 returning to trusted state. A candle touched by untrusted ticks remains
 untrusted.
 
+When recording starts after 09:15, replay never invents missing one-minute bars.
+A trusted tick timestamped from 09:19:58 through 09:19:59.999 can prove the
+completed 09:15-09:20 five-minute aggregate from Angel's maintained session
+open/high/low, LTP, and cumulative equity volume. That aggregate becomes visible
+only at or after 09:20 and carries `ANGEL_SESSION_FIELDS` provenance. A tick at
+or after 09:20, or an older snapshot outside the strict two-second tolerance,
+cannot recover it. A trusted 09:29:58-09:29:59.999 snapshot may supply the
+session open and opening-range high/low only at or after 09:30. Complete local
+one-minute data beginning at 09:15 always takes precedence.
+
+For a late-start equity session, the latest trusted positive Angel ATP is the
+VWAP reference and the latest trusted cumulative session volume is the RVOL
+numerator. Recovered stock and NIFTY session opens anchor relative strength.
+NIFTY ATP/volume remain ignored. Any missing, malformed, stale, out-of-order, or
+post-cutoff proof keeps the affected indicator not ready; replay checks both
+exchange and local receive timestamps so future knowledge cannot leak into an
+as-of scan.
+
 ## Candle and indicator definitions
 
 - One/five-minute candles align from the NSE cash open at 09:15 IST, not process
@@ -326,8 +381,10 @@ untrusted.
 - Candle volume is the non-negative delta of Angel's cumulative session volume.
   The first observation and a cumulative reset contribute zero, preventing
   fabricated volume.
-- Session VWAP uses completed/trusted candles and typical price
-  `(high + low + close) / 3`, weighted by incremental candle volume.
+- With complete local data, session VWAP uses completed/trusted candles and
+  typical price `(high + low + close) / 3`, weighted by incremental candle
+  volume. A late-start equity may instead use only a latest trusted positive
+  Angel ATP session reference.
 - NIFTY regime uses a separate session TWAP: the arithmetic mean of completed,
   trusted five-minute typical prices. NIFTY volume may remain zero and is never
   fabricated or passed to stock VWAP/RVOL logic.
@@ -337,11 +394,12 @@ untrusted.
 - RVOL compares cumulative volume at the same session minute against up to 15
   prior complete/trusted local sessions and requires 10 by default.
 - Relative strength is stock session return minus NIFTY session return, in
-  percentage points. Both trusted current sessions must begin at 09:15; a
-  midday first observation is never treated as the session open.
+  percentage points. Its opens must come from complete local sessions or
+  validated Angel session references; a midday LTP is never treated as open.
 - VWAP distance is reported in percentage and ATR units.
 - Opening range is the trusted high/low over a complete, contiguous first 15
-  session minutes by default.
+  local session minutes by default, or a causal trusted pre-09:30 Angel session
+  snapshot when local recording began late.
 - VWAP, opening range, RVOL and relative strength use only today's session.
   EMA9/EMA20, ATR14 and benchmark EMA warm-up may use prior complete/trusted
   five-minute sessions plus today's completed candles. Sorting across sessions
@@ -393,7 +451,7 @@ credential-free pytest suite.
 Each as-of scan first counts raw ticks without loading them, rejects a count over
 `SCAN_REPLAY_HARD_TICK_LIMIT`, and reports raw ticks replayed plus replay elapsed
 time. Configurable tick/runtime warnings make current replay cost visible. This
-bounded replay remains a Phase 2.2 bridge: an incremental live intelligence
+bounded replay remains a Phase 2.3 bridge: an incremental live intelligence
 worker with persisted health/candle snapshots is the next scaling step before
 any live automation.
 
