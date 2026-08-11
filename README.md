@@ -3,7 +3,7 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.5.1 materializes current-session health, candles, and recovery
+Phase 2.5.2 materializes current-session health, candles, and recovery
 references incrementally while `record-scanner-market` runs. That recorder is
 the single normal projection writer. Normal scans read one transactionally
 consistent SQLite snapshot and never advance or refresh the checkpoint.
@@ -182,7 +182,7 @@ python -m trading_bot compare-projection-replay --date 2026-08-11 --json
 ```
 
 Start or restart `record-scanner-market` after upgrading so it can build the
-current-session projection. On its first Phase 2.5.1 start, it deterministically
+current-session projection. On its first Phase 2.5.2 start, it deterministically
 rebuilds the projection once from today's retained raw ticks. Later restarts
 restore the checkpoint and read only raw ticks/feed events after its cursors.
 Normal `scan` never silently falls back to a full-day replay when the projection
@@ -195,6 +195,14 @@ checkpoint, it returns `NOT_READY` with `projection_catch_up_pending`; leave or
 restart `record-scanner-market` so the recorder-owned projector can catch up.
 The scan process never performs an independent mutable suffix catch-up and
 never changes checkpoint cursors, `updated_at`, or `state_json`.
+
+Latest-state scan reads intentionally do not use the command's pre-cache start
+time as an as-of cutoff. A recorder checkpoint committed while caches are being
+loaded is valid current state. The scanner evaluates exactly at that committed
+checkpoint's `updated_at`, then samples the wall clock again after the snapshot
+load to calculate age from `last_received_at` and enforce the five-second live
+freshness gate. Explicit historical/as-of projection reads still reject a
+checkpoint newer than their requested cutoff.
 
 The ranked candidate lists are preserved even when a candidate is unqualified.
 Human output includes qualification counts and a `QUAL` column. JSON includes
@@ -322,7 +330,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.5.1 architecture
+## Phase 2.5.2 architecture
 
 ```text
 explicit refresh commands
@@ -395,15 +403,18 @@ bounded diagnostic instead of exposing a raw SQLite/value traceback.
 Read-side consistency uses an explicit SQLite snapshot transaction. Checkpoint
 version N is returned with health, references, and completed current-session
 candles from that same commit, never mixed with version N+1. Projection age is
-measured without touching the checkpoint, so repeated scans cannot make stale
-state appear fresh.
+measured from a fresh post-load wall-clock sample without touching the
+checkpoint, so repeated scans cannot make stale state appear fresh. The latest
+read API has no stale caller-time cutoff; its optional explicit cutoff retains
+the causal `ProjectionCutoffBehindCheckpointError` guard for historical callers.
 
 The read-only equivalence command compares projected and replayed health, sequence
 telemetry, completed OHLCV/trust/provenance, references, scanner
 readiness/regime, candidate indicators/scores, and qualification output at the
-persisted checkpoint cutoff. It never materializes or catches up the live
-projection. It exits non-zero on any mismatch and emits only bounded category
-diagnostics:
+persisted checkpoint `updated_at`. It loads latest committed state first, so a
+recorder advance during cache loading is valid rather than mistaken for future
+data. It never materializes or catches up the live projection. It exits
+non-zero on any mismatch and emits only bounded category diagnostics:
 
 ```powershell
 python -m trading_bot compare-projection-replay --date 2026-08-11
@@ -585,7 +596,7 @@ Normal as-of scans load prior historical candles plus one read-only current
 projection snapshot; they do not count or replay the full raw-tick day. The raw
 replay hard limit and timing fields remain for explicit
 `replay`/projection-comparison diagnostics and backward-compatible output.
-Phase 2.5.1 is still local SQLite architecture: large
+Phase 2.5.2 is still local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 

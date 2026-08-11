@@ -29,6 +29,7 @@ from trading_bot.marketdata import (
     ProjectionCatchUpPendingError,
     ProjectionCheckpointAheadError,
     ProjectionConcurrentAdvanceError,
+    ProjectionCutoffBehindCheckpointError,
     ProjectionStateCorruptError,
 )
 from trading_bot.scanner import MarketScanner
@@ -529,6 +530,22 @@ def test_read_only_projection_view_fails_when_recorder_catch_up_is_pending() -> 
             )
 
 
+def test_latest_projection_read_accepts_checkpoint_after_command_start() -> None:
+    checkpoint_time = OPEN + timedelta(seconds=10)
+    with SQLiteMarketRecorder("sqlite:///:memory:") as recorder:
+        recorder.record_tick(_tick(0, second=9))
+        projection = _projection(recorder)
+        projection.initialize(now=checkpoint_time, allow_rebuild=True)
+
+        latest = recorder.load_projection_view(SESSION)
+        with pytest.raises(ProjectionCutoffBehindCheckpointError):
+            recorder.load_projection_view(
+                SESSION, now=OPEN + timedelta(seconds=5)
+            )
+
+    assert latest.checkpoint.updated_at == checkpoint_time
+
+
 def test_stale_projection_writer_cas_cannot_overwrite_newer_recorder(
     tmp_path,
 ) -> None:
@@ -642,6 +659,17 @@ def test_projection_freshness_gate_is_fail_closed_only_during_live_session() -> 
         last_received_at=live_now + timedelta(seconds=1),
         stale_after_seconds=5,
     ) == "projection_timestamp_in_future"
+    assert cli._projection_freshness_reason(
+        now=live_now,
+        projection_age_seconds=0,
+        last_received_at=live_now,
+        checkpoint_updated_at=live_now + timedelta(seconds=1),
+        stale_after_seconds=5,
+    ) == "projection_timestamp_in_future"
+    assert cli._projection_age_seconds(
+        now=live_now,
+        last_received_at=live_now - timedelta(seconds=3),
+    ) == 3
     payload = cli._projection_not_ready_payload(
         settings=Settings(_env_file=None),
         nifty_count=1,
@@ -662,7 +690,10 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
     monkeypatch, capsys
 ) -> None:
     settings = Settings(_env_file=None, database_url="sqlite:///:memory:")
-    current = datetime.now(IST)
+    command_started_at = OPEN + timedelta(minutes=1)
+    checkpoint_updated_at = command_started_at + timedelta(seconds=2)
+    freshness_sampled_at = checkpoint_updated_at + timedelta(seconds=1)
+    clock_values = iter((command_started_at, freshness_sampled_at))
     universe = SimpleNamespace(
         instruments=(),
         expected_eligibility_exclusions=(),
@@ -688,17 +719,17 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
         def load_candles(self, **_kwargs):
             return []
 
-        def load_projection_view(self, _session_date, *, now):
+        def load_projection_view(self, _session_date):
             return view
 
     checkpoint = SimpleNamespace(
         last_tick_id=77,
-        last_received_at=current - timedelta(seconds=1),
-        updated_at=current - timedelta(milliseconds=500),
+        last_received_at=checkpoint_updated_at,
+        updated_at=checkpoint_updated_at,
     )
     view = SimpleNamespace(
         checkpoint=checkpoint,
-        projection_age_seconds=1.0,
+        projection_age_seconds=999.0,
         candles=(),
         health=(),
         session_references=(),
@@ -740,6 +771,7 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
                     "projection_last_tick_id": kwargs[
                         "projection_last_tick_id"
                     ],
+                    "scanner_evaluation_at": kwargs["now"].isoformat(),
                 }
             )
             return Result()
@@ -753,6 +785,7 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
         cli, "resolve_nse_equity_universe", lambda *_args, **_kwargs: universe
     )
     monkeypatch.setattr(cli, "_recorder", lambda _settings: Recorder())
+    monkeypatch.setattr(cli, "_ist_now", lambda: next(clock_values))
     monkeypatch.setattr(
         cli,
         "_projection",
@@ -760,7 +793,6 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
             AssertionError("normal scan must not construct a mutable projection")
         ),
     )
-    monkeypatch.setattr(cli, "_market_expected_live", lambda _now: False)
     monkeypatch.setattr(cli, "_market_scanner", lambda _settings: Scanner())
     monkeypatch.setattr(
         cli,
@@ -777,6 +809,8 @@ def test_normal_scan_uses_projection_telemetry_and_never_calls_replay(
     assert '"raw_ticks_replayed": 0' in payload
     assert '"full_replay_used": false' in payload
     assert '"projection_last_tick_id": 77' in payload
+    assert '"projection_age_seconds": 1.0' in payload
+    assert checkpoint_updated_at.isoformat() in payload
 
 
 def test_scan_fails_closed_on_projection_concurrency_conflict(
@@ -803,7 +837,7 @@ def test_scan_fails_closed_on_projection_concurrency_conflict(
         def __exit__(self, *_args):
             return None
 
-        def load_projection_view(self, _session_date, *, now):
+        def load_projection_view(self, _session_date):
             raise ProjectionConcurrentAdvanceError("simulated recorder advance")
 
     instrument_master = SimpleNamespace(find_trading_symbol=lambda *_args: None)
@@ -840,6 +874,13 @@ def test_compare_projection_replay_does_not_mutate_checkpoint(
         projection.initialize(now=OPEN + timedelta(seconds=2), allow_rebuild=True)
         before = recorder.load_projection_checkpoint(SESSION)
     assert before is not None
+    replay_engine = cli._replay_engine(settings)
+    replay_cutoffs: list[datetime] = []
+
+    class ReplayEngine:
+        def replay_date(self, recorder, session_date, **kwargs):
+            replay_cutoffs.append(kwargs["evaluation_at"])
+            return replay_engine.replay_date(recorder, session_date, **kwargs)
 
     class Cache:
         def __init__(self, value) -> None:
@@ -866,6 +907,11 @@ def test_compare_projection_replay_does_not_mutate_checkpoint(
     monkeypatch.setattr(
         cli, "resolve_nse_equity_universe", lambda *_args, **_kwargs: universe
     )
+    clock_values = iter(
+        (OPEN + timedelta(seconds=1), OPEN + timedelta(seconds=3))
+    )
+    monkeypatch.setattr(cli, "_ist_now", lambda: next(clock_values))
+    monkeypatch.setattr(cli, "_replay_engine", lambda _settings: ReplayEngine())
     monkeypatch.setattr(
         cli,
         "_projection",
@@ -880,11 +926,13 @@ def test_compare_projection_replay_does_not_mutate_checkpoint(
         )
         == 0
     )
-    capsys.readouterr()
+    payload = capsys.readouterr().out
     with SQLiteMarketRecorder(database_url) as recorder:
         after = recorder.load_projection_checkpoint(SESSION)
 
     assert after == before
+    assert replay_cutoffs == [before.updated_at]
+    assert before.updated_at.isoformat() in payload
 
 
 def _health_semantics(items) -> tuple[tuple[object, ...], ...]:

@@ -865,10 +865,14 @@ class SQLiteMarketRecorder:
         return [_row_to_session_reference(row) for row in rows]
 
     def load_projection_view(
-        self, session_date: date, *, now: datetime
+        self, session_date: date, *, now: datetime | None = None
     ) -> ProjectionView:
-        """Load one read-only, transactionally consistent projection commit."""
-        evaluation = datetime.fromisoformat(_aware_iso(now))
+        """Load one consistent commit, optionally enforcing an explicit cutoff."""
+        evaluation = (
+            None
+            if now is None
+            else datetime.fromisoformat(_aware_iso(now))
+        )
         session_text = session_date.isoformat()
         start_at, end_at = _session_iso_bounds(session_date)
         with self._lock:
@@ -944,7 +948,7 @@ class SQLiteMarketRecorder:
             raise ProjectionStateCorruptError(
                 "projection checkpoint session date is inconsistent"
             )
-        if any(
+        if evaluation is not None and any(
             timestamp is not None and timestamp > evaluation
             for timestamp in (
                 checkpoint.updated_at,
@@ -989,9 +993,10 @@ class SQLiteMarketRecorder:
         )
         projection_age = None
         if checkpoint.last_received_at is not None:
+            age_at = checkpoint.updated_at if evaluation is None else evaluation
             projection_age = max(
                 0.0,
-                (evaluation - checkpoint.last_received_at).total_seconds(),
+                (age_at - checkpoint.last_received_at).total_seconds(),
             )
         return ProjectionView(
             checkpoint=checkpoint,

@@ -22,6 +22,7 @@ from .marketdata import (
     HistoricalBootstrapService,
     MarketIntelligenceProjection,
     MarketReplayEngine,
+    ProjectionCutoffBehindCheckpointError,
     ProjectionError,
     ReplaySafetyLimitExceeded,
     YFinanceHistoricalProvider,
@@ -134,7 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.1")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.2")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -596,7 +597,7 @@ def _compare_projection_replay(
     settings: Settings, *, session_date: date, json_output: bool
 ) -> int:
     """Compare materialized and raw-replay semantics at one deterministic cutoff."""
-    now = datetime.now(IST)
+    now = _ist_now()
     session_close = datetime.combine(session_date, time(15, 30), tzinfo=IST)
     evaluation_at = min(now, session_close)
     try:
@@ -615,10 +616,16 @@ def _compare_projection_replay(
         if benchmark is not None and benchmark.instrument_type != "AMXIDX":
             benchmark = None
         with _recorder(settings) as recorder:
-            view = recorder.load_projection_view(
-                session_date,
-                now=now,
-            )
+            view = recorder.load_projection_view(session_date)
+            snapshot_observed_at = _ist_now()
+            if _projection_timestamp_is_future(
+                now=snapshot_observed_at,
+                last_received_at=view.checkpoint.last_received_at,
+                checkpoint_updated_at=view.checkpoint.updated_at,
+            ):
+                raise ProjectionCutoffBehindCheckpointError(
+                    "projection checkpoint is ahead of the latest read time"
+                )
             evaluation_at = view.checkpoint.updated_at
             replay = _replay_engine(settings).replay_date(
                 recorder,
@@ -842,7 +849,7 @@ def _print_comparison_payload(
 
 
 def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
-    now = datetime.now(IST)
+    now = _ist_now()
     try:
         instrument_cache = _instrument_cache(settings).load(now=now)
         intraday_cache = _intraday_cache(settings).load(now=now)
@@ -901,7 +908,7 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
     with _recorder(settings) as recorder:
         projection_started = perf_counter()
         try:
-            view = recorder.load_projection_view(now.date(), now=now)
+            view = recorder.load_projection_view(now.date())
         except ProjectionError as exc:
             payload = _projection_not_ready_payload(
                 settings=settings,
@@ -913,12 +920,17 @@ def _scan(settings: Settings, *, json_output: bool, limit: int) -> int:
             _print_scan_payload(payload, json_output=json_output, limit=limit)
             return 2
         projection_load_seconds = perf_counter() - projection_started
-        projection_age = view.projection_age_seconds
+        freshness_now = _ist_now()
+        projection_age = _projection_age_seconds(
+            now=freshness_now,
+            last_received_at=view.checkpoint.last_received_at,
+        )
         evaluation_at = view.checkpoint.updated_at
         freshness_reason = _projection_freshness_reason(
-            now=now,
+            now=freshness_now,
             projection_age_seconds=projection_age,
             last_received_at=view.checkpoint.last_received_at,
+            checkpoint_updated_at=view.checkpoint.updated_at,
             stale_after_seconds=settings.scanner_projection_stale_after_seconds,
         )
         if freshness_reason is not None:
@@ -1064,9 +1076,14 @@ def _projection_freshness_reason(
     now: datetime,
     projection_age_seconds: float | None,
     last_received_at: datetime | None,
+    checkpoint_updated_at: datetime | None = None,
     stale_after_seconds: float,
 ) -> str | None:
-    if last_received_at is not None and last_received_at > now:
+    if _projection_timestamp_is_future(
+        now=now,
+        last_received_at=last_received_at,
+        checkpoint_updated_at=checkpoint_updated_at,
+    ):
         return "projection_timestamp_in_future"
     if not _market_expected_live(now):
         return None
@@ -1076,6 +1093,30 @@ def _projection_freshness_reason(
     ):
         return f"projection_stale:{projection_age_seconds}>{stale_after_seconds}"
     return None
+
+
+def _projection_timestamp_is_future(
+    *,
+    now: datetime,
+    last_received_at: datetime | None,
+    checkpoint_updated_at: datetime | None,
+) -> bool:
+    return any(
+        timestamp is not None and timestamp > now
+        for timestamp in (last_received_at, checkpoint_updated_at)
+    )
+
+
+def _projection_age_seconds(
+    *, now: datetime, last_received_at: datetime | None
+) -> float | None:
+    if last_received_at is None:
+        return None
+    return max(0.0, (now - last_received_at).total_seconds())
+
+
+def _ist_now() -> datetime:
+    return datetime.now(IST)
 
 
 def _market_scanner(settings: Settings) -> MarketScanner:
