@@ -3,10 +3,13 @@
 Local-first, paper-first Angel One SmartAPI market-data recorder and deterministic
 market-intelligence scanner for Indian equities.
 
-Phase 2.5.2 materializes current-session health, candles, and recovery
+Phase 2.5.3 materializes current-session health, candles, and recovery
 references incrementally while `record-scanner-market` runs. That recorder is
 the single normal projection writer. Normal scans read one transactionally
 consistent SQLite snapshot and never advance or refresh the checkpoint.
+Durable candle completion follows same-instrument exchange-time progression;
+wall-clock-complete working buckets are read-only ephemeral views until that
+progression makes them stable.
 Phase 2.4 ranking and qualification semantics remain unchanged, and scanner
 results and qualified signals remain analysis only.
 There is no paper execution, order interface, or live order-placement code.
@@ -182,9 +185,11 @@ python -m trading_bot compare-projection-replay --date 2026-08-11 --json
 ```
 
 Start or restart `record-scanner-market` after upgrading so it can build the
-current-session projection. On its first Phase 2.5.2 start, it deterministically
-rebuilds the projection once from today's retained raw ticks. Later restarts
-restore the checkpoint and read only raw ticks/feed events after its cursors.
+current-session projection. Phase 2.5.3 increments the projection state version,
+so its first start deterministically rebuilds today's derived projection once
+from retained authoritative raw ticks. The rebuild preserves raw ticks, feed
+events, and prior historical candles. Later restarts restore the checkpoint and
+read only raw ticks/feed events after its cursors.
 Normal `scan` never silently falls back to a full-day replay when the projection
 is unavailable or inconsistent.
 
@@ -330,7 +335,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.5.2 architecture
+## Phase 2.5.3 architecture
 
 ```text
 explicit refresh commands
@@ -346,7 +351,8 @@ recorded SmartAPI ticks
   -> feed-epoch health monitor + sequence telemetry
   -> causal session references + deterministic 09:15 IST candle aggregation
   -> raw SQLite audit rows
-  -> incremental current-session projection + checkpointed working state
+  -> exchange-progressed stable candles + checkpointed working state
+  -> read-only ephemeral as-of candles for wall-clock-complete working buckets
   -> idempotent SQLite candles + complete-session RVOL baselines
   -> replay-safe indicators + NIFTY regime
   -> explainable analysis-only scanner rankings
@@ -386,11 +392,25 @@ SQLite materializes:
 
 The checkpoint includes in-progress candle buckets, cumulative-volume anchors,
 health recovery counters, and session-reference accumulators. A valid restart
-therefore processes only rows after both cursors. A missing or corrupt
-checkpoint is rebuilt once by `record-scanner-market`; a checkpoint claiming a
-raw tick/event ID ahead of SQLite fails closed because it could indicate lost
-authoritative data. Current-session raw ticks remain retained for audit and the
-explicit `replay` command.
+therefore processes only rows after both cursors and does not flush restored
+working candles merely because restart wall time is later. A missing, corrupt,
+or older-version checkpoint is rebuilt once by `record-scanner-market`; the
+rebuild clears only current-session derived projection rows with
+`LOCAL_TICKS`/`ANGEL_SESSION_FIELDS` provenance. A checkpoint claiming a raw
+tick/event ID ahead of SQLite fails closed because it could indicate lost
+authoritative data. Current-session raw ticks and feed events, plus prior
+historical sessions, remain retained for audit and explicit replay.
+
+Normal durable candle completion is caused only when a valid tick for the same
+instrument advances into a later exchange-time bucket. A recorder batch crossing
+a received-time or wall-clock minute boundary never finalizes working candles.
+The checkpoint retains those working OHLCV/trust aggregates. A read-only
+projection snapshot may expose a working bucket whose `end_at` is at or before
+the committed checkpoint time as an ephemeral completed candle. It does not
+delete working state or write that provisional candle to `market_candles`, so a
+later valid tick in the same exchange-time bucket can revise the next view.
+Cumulative-volume deltas and reconnect/untrusted-tick contamination therefore
+remain identical to deterministic raw replay.
 
 Projection commits use optimistic compare-and-swap inside an immediate SQLite
 write transaction. The writer may replace the materialized health/reference
@@ -401,12 +421,15 @@ newer state. A scan encountering a projection conflict fails closed with a
 bounded diagnostic instead of exposing a raw SQLite/value traceback.
 
 Read-side consistency uses an explicit SQLite snapshot transaction. Checkpoint
-version N is returned with health, references, and completed current-session
-candles from that same commit, never mixed with version N+1. Projection age is
-measured from a fresh post-load wall-clock sample without touching the
-checkpoint, so repeated scans cannot make stale state appear fresh. The latest
-read API has no stale caller-time cutoff; its optional explicit cutoff retains
-the causal `ProjectionCutoffBehindCheckpointError` guard for historical callers.
+version N is returned with health, references, durable current-session candles,
+and ephemeral completed working candles reconstructed from version N's
+`state_json`, never mixed with version N+1. Ephemeral identities are
+deterministically deduplicated with durable rows and first-five-minute recovery.
+Projection age is measured from a fresh post-load wall-clock sample without
+touching the checkpoint, so repeated scans cannot make stale state appear fresh.
+The latest read API has no stale caller-time cutoff; its optional explicit cutoff
+retains the causal `ProjectionCutoffBehindCheckpointError` guard for historical
+callers.
 
 The read-only equivalence command compares projected and replayed health, sequence
 telemetry, completed OHLCV/trust/provenance, references, scanner
@@ -421,8 +444,10 @@ python -m trading_bot compare-projection-replay --date 2026-08-11
 python -m trading_bot compare-projection-replay --date 2026-08-11 --json
 ```
 
-This verification path intentionally performs raw replay. It has no order
-capability.
+This verification path intentionally performs raw replay. Candle mismatches
+include bounded projection/replay counts, only-on-one-side counts, changed-value
+counts, and at most five example identities with their differing fields. It has
+no order capability.
 
 ## Data-health meanings
 
@@ -481,6 +506,10 @@ as-of scan.
 - One/five-minute candles align from the NSE cash open at 09:15 IST, not process
   start. Only completed candles are persisted; strategy-style confirmation uses
   completed five-minute candles.
+- Incremental persistence completes a candle only after a later exchange-time
+  bucket is observed for that same instrument. Read views may include a
+  non-persisted, wall-clock-complete working candle at the committed as-of time;
+  later ticks can revise it until exchange-time progression makes it durable.
 - Candle volume is the non-negative delta of Angel's cumulative session volume.
   The first observation and a cumulative reset contribute zero, preventing
   fabricated volume.
@@ -596,7 +625,7 @@ Normal as-of scans load prior historical candles plus one read-only current
 projection snapshot; they do not count or replay the full raw-tick day. The raw
 replay hard limit and timing fields remain for explicit
 `replay`/projection-comparison diagnostics and backward-compatible output.
-Phase 2.5.2 is still local SQLite architecture: large
+Phase 2.5.3 is still local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 

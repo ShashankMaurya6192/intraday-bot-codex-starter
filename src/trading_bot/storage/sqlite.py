@@ -39,6 +39,7 @@ from trading_bot.marketdata.projection import (
     ProjectionStateCorruptError,
     ProjectionUnavailableError,
     ProjectionView,
+    projection_candles_as_of,
 )
 from trading_bot.marketdata.recovery import opening_references_visible
 
@@ -283,6 +284,13 @@ class SQLiteMarketRecorder:
                 VALUES (?, ?)
                 """,
                 (5, datetime.now(IST).isoformat()),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_version(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (6, datetime.now(IST).isoformat()),
             )
             self._connection.commit()
 
@@ -939,7 +947,18 @@ class SQLiteMarketRecorder:
                 (str(row["reference_kind"]), _row_to_session_reference(row))
                 for row in reference_rows
             )
-            candles = tuple(_row_to_candle(row) for row in candle_rows)
+            durable_candles = tuple(_row_to_candle(row) for row in candle_rows)
+            first_five = tuple(
+                item
+                for kind, item in references
+                if kind == "BEFORE_FIRST_FIVE"
+            )
+            candles = projection_candles_as_of(
+                checkpoint=checkpoint,
+                durable_candles=durable_candles,
+                first_five_references=first_five,
+                evaluation_at=checkpoint.updated_at,
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise ProjectionStateCorruptError(
                 "materialized projection snapshot is corrupt"

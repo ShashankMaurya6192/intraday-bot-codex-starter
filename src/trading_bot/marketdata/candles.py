@@ -133,6 +133,25 @@ class SessionCandleAggregator:
             )
         )
 
+    def snapshot_completed(self, *, until: datetime) -> tuple[Candle, ...]:
+        """Return as-of completed working buckets without mutating engine state."""
+        timestamp = _aware(until)
+        return tuple(
+            sorted(
+                (
+                    current.finish()
+                    for current in self._working.values()
+                    if current.end_at <= timestamp
+                ),
+                key=lambda item: (
+                    item.exchange.value,
+                    item.symbol_token,
+                    item.start_at,
+                    item.interval,
+                ),
+            )
+        )
+
     def checkpoint_state(self) -> dict[str, object]:
         """Return validated engine state needed for suffix-only restart catch-up."""
         return {

@@ -11,14 +11,14 @@ from trading_bot.domain import IST, Exchange, FeedEvent, FeedEventType, MarketTi
 
 from .candles import SessionCandleAggregator
 from .health import MarketDataHealthMonitor
-from .models import Candle, InstrumentHealth, SessionReference
+from .models import Candle, CandleInterval, InstrumentHealth, SessionReference
 from .recovery import (
     SessionReferenceAccumulator,
     opening_references_visible,
     recover_first_five_minute_candles,
 )
 
-PROJECTION_STATE_VERSION = 1
+PROJECTION_STATE_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,10 +335,16 @@ class MarketIntelligenceProjection:
                 (evaluation - checkpoint.last_received_at).total_seconds(),
             )
         start_at, end_at = _session_bounds(self._session_date)
+        persisted = self._store.load_candles(start_at=start_at, end_at=end_at)
         return ProjectionView(
             checkpoint=checkpoint,
-            candles=tuple(
-                self._store.load_candles(start_at=start_at, end_at=end_at)
+            candles=projection_candles_as_of(
+                checkpoint=checkpoint,
+                durable_candles=persisted,
+                first_five_references=tuple(
+                    self._references.before_first_five.values()
+                ),
+                evaluation_at=evaluation,
             ),
             health=self._monitor.all_health(now=evaluation),
             session_references=tuple(
@@ -455,10 +461,6 @@ class MarketIntelligenceProjection:
         checkpoint = self._require_checkpoint()
         evaluation = _health_evaluation_at(checkpoint, evaluation)
         session_open, session_end = _session_bounds(self._session_date)
-        if evaluation >= session_open:
-            self._pending_candles.extend(
-                self._aggregator.flush(until=min(evaluation, session_end))
-            )
         persisted = self._store.load_candles(
             start_at=session_open,
             end_at=session_end,
@@ -603,6 +605,59 @@ class MarketIntelligenceProjection:
         if self._checkpoint is None:
             raise ProjectionUnavailableError("projection is not initialized")
         return self._checkpoint
+
+
+def projection_candles_as_of(
+    *,
+    checkpoint: ProjectionCheckpoint,
+    durable_candles: Sequence[Candle],
+    first_five_references: Sequence[SessionReference],
+    evaluation_at: datetime,
+) -> tuple[Candle, ...]:
+    """Combine stable rows with non-durable completed working buckets."""
+    cutoff = _aware(evaluation_at)
+    raw_candle_state = checkpoint.engine_state.get("candles")
+    if not isinstance(raw_candle_state, Mapping):
+        raise ValueError("projection candle engine state is missing")
+    aggregator = SessionCandleAggregator()
+    aggregator.restore_checkpoint_state(raw_candle_state)
+    by_identity = {
+        _candle_identity(candle): candle for candle in durable_candles
+    }
+    for candle in aggregator.snapshot_completed(until=cutoff):
+        by_identity[_candle_identity(candle)] = candle
+    references = {
+        (reference.exchange, reference.symbol_token): reference
+        for reference in first_five_references
+    }
+    recovered = recover_first_five_minute_candles(
+        list(by_identity.values()),
+        references,
+        evaluation_at=cutoff,
+    )
+    deduplicated = {_candle_identity(candle): candle for candle in recovered}
+    return tuple(
+        sorted(
+            deduplicated.values(),
+            key=lambda candle: (
+                candle.exchange.value,
+                candle.symbol_token,
+                candle.start_at,
+                candle.interval,
+            ),
+        )
+    )
+
+
+def _candle_identity(
+    candle: Candle,
+) -> tuple[Exchange, str, CandleInterval, datetime]:
+    return (
+        candle.exchange,
+        candle.symbol_token,
+        candle.interval,
+        candle.start_at,
+    )
 
 
 def _references_state(

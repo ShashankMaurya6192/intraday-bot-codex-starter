@@ -135,7 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.2")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.3")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -673,11 +673,18 @@ def _compare_projection_replay(
         _print_comparison_payload(payload, json_output=json_output)
         return 2
 
+    candle_difference = _candle_difference(view.candles, replay.candles)
     comparisons = {
         "health": _health_comparison(view.health)
         == _health_comparison(replay.health),
-        "candles": _candle_comparison(view.candles)
-        == _candle_comparison(replay.candles),
+        "candles": not any(
+            candle_difference[key]
+            for key in (
+                "only_projection_count",
+                "only_replay_count",
+                "changed_count",
+            )
+        ),
         "session_references": view.session_references
         == replay.session_references,
         "opening_range_references": view.opening_range_references
@@ -695,6 +702,7 @@ def _compare_projection_replay(
         "raw_ticks_replayed": replay.raw_ticks_replayed,
         "projection_readiness": projection_scan.readiness.value,
         "replay_readiness": replay_scan.readiness.value,
+        "candle_difference": candle_difference,
         "order_placement_available": False,
     }
     _print_comparison_payload(payload, json_output=json_output)
@@ -784,32 +792,105 @@ def _health_comparison(items: Sequence) -> tuple[tuple[object, ...], ...]:
     )
 
 
-def _candle_comparison(items: Sequence[Candle]) -> tuple[tuple[object, ...], ...]:
+def _candle_difference(
+    projection: Sequence[Candle], replay: Sequence[Candle]
+) -> dict[str, object]:
+    """Return bounded, JSON-safe candle mismatch diagnostics."""
+    projection_by = {_candle_identity(item): item for item in projection}
+    replay_by = {_candle_identity(item): item for item in replay}
+    projection_keys = set(projection_by)
+    replay_keys = set(replay_by)
+    only_projection = sorted(projection_keys - replay_keys)
+    only_replay = sorted(replay_keys - projection_keys)
+    changed = [
+        key
+        for key in sorted(projection_keys & replay_keys)
+        if _candle_field_values(projection_by[key])
+        != _candle_field_values(replay_by[key])
+    ]
+    example_limit = 5
+    return {
+        "projection_count": len(projection_by),
+        "replay_count": len(replay_by),
+        "only_projection_count": len(only_projection),
+        "only_replay_count": len(only_replay),
+        "changed_count": len(changed),
+        "only_projection_examples": [
+            _candle_identity_payload(key)
+            for key in only_projection[:example_limit]
+        ],
+        "only_replay_examples": [
+            _candle_identity_payload(key) for key in only_replay[:example_limit]
+        ],
+        "changed_examples": [
+            {
+                "identity": _candle_identity_payload(key),
+                "fields": {
+                    field: {
+                        "projection": projection_value,
+                        "replay": replay_value,
+                    }
+                    for (
+                        field,
+                        projection_value,
+                        replay_value,
+                    ) in _different_candle_fields(
+                        projection_by[key], replay_by[key]
+                    )
+                },
+            }
+            for key in changed[:example_limit]
+        ],
+        "example_limit": example_limit,
+    }
+
+
+def _candle_identity(candle: Candle) -> tuple[str, str, int, datetime]:
+    return (
+        candle.exchange.value,
+        candle.symbol_token,
+        int(candle.interval),
+        candle.start_at,
+    )
+
+
+def _candle_identity_payload(
+    identity: tuple[str, str, int, datetime],
+) -> dict[str, object]:
+    exchange, symbol_token, interval_minutes, start_at = identity
+    return {
+        "exchange": exchange,
+        "symbol_token": symbol_token,
+        "interval_minutes": interval_minutes,
+        "start_at": start_at.isoformat(),
+    }
+
+
+def _candle_field_values(candle: Candle) -> dict[str, object]:
+    return {
+        "trading_symbol": candle.trading_symbol,
+        "end_at": candle.end_at.isoformat(),
+        "open_price": str(candle.open_price),
+        "high_price": str(candle.high_price),
+        "low_price": str(candle.low_price),
+        "close_price": str(candle.close_price),
+        "volume": candle.volume,
+        "tick_count": candle.tick_count,
+        "completed": candle.completed,
+        "trusted": candle.trusted,
+        "provenance": candle.provenance.value,
+    }
+
+
+def _different_candle_fields(
+    projection: Candle, replay: Candle
+) -> tuple[tuple[str, object, object], ...]:
+    projection_values = _candle_field_values(projection)
+    replay_values = _candle_field_values(replay)
     return tuple(
-        (
-            item.exchange.value,
-            item.symbol_token,
-            int(item.interval),
-            item.start_at,
-            item.end_at,
-            item.open_price,
-            item.high_price,
-            item.low_price,
-            item.close_price,
-            item.volume,
-            item.tick_count,
-            item.trusted,
-            item.provenance.value,
-        )
-        for item in sorted(
-            items,
-            key=lambda candle: (
-                candle.exchange.value,
-                candle.symbol_token,
-                candle.start_at,
-                candle.interval,
-            ),
-        )
+        (field, projection_values[field], replay_values[field])
+        for field in projection_values
+        if projection_values[field] != replay_values[field]
     )
 
 
@@ -845,6 +926,16 @@ def _print_comparison_payload(
     )
     for mismatch in payload.get("mismatches", []):
         print(f"  mismatch={mismatch}")
+    candle_difference = payload.get("candle_difference")
+    if isinstance(candle_difference, dict):
+        print(
+            "  candles="
+            f"projection:{candle_difference['projection_count']} "
+            f"replay:{candle_difference['replay_count']} "
+            f"only_projection:{candle_difference['only_projection_count']} "
+            f"only_replay:{candle_difference['only_replay_count']} "
+            f"changed:{candle_difference['changed_count']}"
+        )
     print("Order placement available=False")
 
 
