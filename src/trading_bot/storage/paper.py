@@ -189,6 +189,25 @@ class SQLitePaperStore:
             ).fetchone()
         return None if row is None else _row_to_day(row)
 
+    def list_days(
+        self,
+        *,
+        from_date: date,
+        to_date: date,
+    ) -> tuple[PaperTradingDay, ...]:
+        if to_date < from_date:
+            raise ValueError("to_date must not precede from_date")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM paper_trading_day
+                WHERE session_date BETWEEN ? AND ?
+                ORDER BY session_date
+                """,
+                (from_date.isoformat(), to_date.isoformat()),
+            ).fetchall()
+        return tuple(_row_to_day(row) for row in rows)
+
     def load_order_by_client_tag(self, client_tag: str) -> PaperOrder | None:
         with self._lock:
             row = self._connection.execute(

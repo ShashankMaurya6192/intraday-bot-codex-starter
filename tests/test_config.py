@@ -31,6 +31,11 @@ def test_default_is_paper() -> None:
     assert settings.paper_square_off_time == time(15, 15)
     assert settings.paper_slippage_bps == Decimal("5")
     assert settings.paper_tick_participation_pct == Decimal("0.10")
+    assert settings.paper_stop_buffer_atr == Decimal("0.10")
+    assert settings.paper_minimum_stop_ticks == 2
+    assert settings.paper_maximum_stop_atr == Decimal("1.50")
+    assert settings.paper_brokerage_rate == Decimal("0.001")
+    assert settings.paper_stt_sell_rate == Decimal("0.00025")
     assert not hasattr(settings, "market_data_allowed_sequence_gap")
     assert settings.configured_scanner_symbols() == ()
 
@@ -158,3 +163,10 @@ def test_paper_times_and_partial_percentages_are_validated() -> None:
 
     with pytest.raises(ValidationError, match="before 15:30"):
         Settings(_env_file=None, paper_square_off_time="15:30")
+
+    with pytest.raises(ValidationError, match="minimum cannot exceed maximum"):
+        Settings(
+            _env_file=None,
+            paper_brokerage_minimum_per_order="21",
+            paper_brokerage_maximum_per_order="20",
+        )

@@ -29,7 +29,14 @@ from .marketdata import (
     YFinanceHistoricalProvider,
     run_historical_diagnostic,
 )
-from .paper import PaperExecutionConfig, PaperExecutionEngine
+from .paper import (
+    IndianEquityIntradayCostModel,
+    IndianEquityIntradayCostSchedule,
+    PaperExecutionConfig,
+    PaperExecutionEngine,
+    PaperPerformanceAnalyzer,
+    PaperReportStatus,
+)
 from .reference_data import (
     NIFTY500_CONSTITUENTS_URL,
     Nifty500Cache,
@@ -142,6 +149,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     paper_kill.add_argument("--date", type=_iso_date)
     paper_kill.add_argument("--reason", required=True)
+    paper_report = subparsers.add_parser(
+        "paper-report",
+        help="report multi-session PAPER results with estimated Indian charges",
+    )
+    paper_report.add_argument("--from-date", type=_iso_date)
+    paper_report.add_argument("--to-date", type=_iso_date)
+    paper_report.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -170,6 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("Scanner output=ANALYSIS_ONLY")
         print("Paper execution engine available=True")
+        print("Qualified-signal PAPER intent policy available=True")
         print("Automated signal-to-paper runner available=False")
         print("Order placement available=False")
         return 0
@@ -275,6 +290,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings,
             session_date=args.date,
             reason=args.reason,
+        )
+
+    if command == "paper-report":
+        return _paper_report(
+            settings,
+            from_date=args.from_date,
+            to_date=args.to_date,
+            json_output=args.json_output,
         )
 
     raise AssertionError(f"unhandled command: {command}")
@@ -400,6 +423,43 @@ def _paper_kill_switch(
     )
     print("No broker order was created or transmitted.")
     return 0
+
+
+def _paper_report(
+    settings: Settings,
+    *,
+    from_date: date | None,
+    to_date: date | None,
+    json_output: bool,
+) -> int:
+    today = datetime.now(IST).date()
+    selected_from = from_date or to_date or today
+    selected_to = to_date or from_date or today
+    with _paper_store(settings) as store:
+        report = PaperPerformanceAnalyzer(
+            store,
+            IndianEquityIntradayCostModel(_paper_cost_schedule(settings)),
+        ).report(from_date=selected_from, to_date=selected_to)
+    payload = report.to_dict()
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"PAPER report status={report.status.value} "
+            f"sessions={report.session_count} closed_trades={report.closed_trades}"
+        )
+        print(
+            f"gross_realized_pnl={report.gross_realized_pnl} "
+            f"estimated_costs={report.estimated_costs_paid} "
+            f"estimated_net_realized_pnl={report.estimated_net_realized_pnl}"
+        )
+        print(
+            f"win_rate={payload['win_rate']} "
+            f"expectancy={payload['expectancy_per_closed_trade']} "
+            f"max_drawdown={report.maximum_closed_trade_drawdown}"
+        )
+        print("cost_basis=ESTIMATE_ONLY_NOT_A_CONTRACT_NOTE broker_orders=False")
+    return 0 if report.status is PaperReportStatus.COMPLETE else 2
 
 
 def _record_market(settings: Settings) -> int:
@@ -1604,6 +1664,25 @@ def _paper_engine(
         ),
         entry_start=settings.paper_entry_start_time,
         last_entry=settings.paper_last_entry_time,
+    )
+
+
+def _paper_cost_schedule(settings: Settings) -> IndianEquityIntradayCostSchedule:
+    return IndianEquityIntradayCostSchedule(
+        as_of=settings.paper_cost_schedule_as_of,
+        brokerage_rate=settings.paper_brokerage_rate,
+        brokerage_minimum_per_order=(
+            settings.paper_brokerage_minimum_per_order
+        ),
+        brokerage_maximum_per_order=(
+            settings.paper_brokerage_maximum_per_order
+        ),
+        exchange_transaction_rate=settings.paper_exchange_transaction_rate,
+        stt_sell_rate=settings.paper_stt_sell_rate,
+        ipft_rate=settings.paper_ipft_rate,
+        sebi_turnover_rate=settings.paper_sebi_turnover_rate,
+        stamp_duty_buy_rate=settings.paper_stamp_duty_buy_rate,
+        gst_rate=settings.paper_gst_rate,
     )
 
 

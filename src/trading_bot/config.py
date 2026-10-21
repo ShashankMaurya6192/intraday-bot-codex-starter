@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -119,6 +119,35 @@ class Settings(BaseSettings):
     paper_second_partial_pct: Decimal = Field(
         default=Decimal("0.25"), ge=0, le=1
     )
+    paper_stop_buffer_atr: Decimal = Field(default=Decimal("0.10"), ge=0, le=10)
+    paper_minimum_stop_ticks: int = Field(default=2, ge=1, le=100)
+    paper_maximum_stop_atr: Decimal = Field(
+        default=Decimal("1.50"), gt=0, le=10
+    )
+    paper_cost_schedule_as_of: date = date(2026, 10, 21)
+    paper_brokerage_rate: Decimal = Field(default=Decimal("0.001"), ge=0, le=1)
+    paper_brokerage_minimum_per_order: Decimal = Field(
+        default=Decimal("5"), ge=0
+    )
+    paper_brokerage_maximum_per_order: Decimal = Field(
+        default=Decimal("20"), ge=0
+    )
+    paper_exchange_transaction_rate: Decimal = Field(
+        default=Decimal("0.000030699"), ge=0, le=1
+    )
+    paper_stt_sell_rate: Decimal = Field(
+        default=Decimal("0.00025"), ge=0, le=1
+    )
+    paper_ipft_rate: Decimal = Field(
+        default=Decimal("0.000000001"), ge=0, le=1
+    )
+    paper_sebi_turnover_rate: Decimal = Field(
+        default=Decimal("0.000001"), ge=0, le=1
+    )
+    paper_stamp_duty_buy_rate: Decimal = Field(
+        default=Decimal("0.00003"), ge=0, le=1
+    )
+    paper_gst_rate: Decimal = Field(default=Decimal("0.18"), ge=0, le=1)
 
     @field_validator("database_url")
     @classmethod
@@ -224,6 +253,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "paper second partial requires a non-zero first partial"
             )
+        if (
+            self.paper_brokerage_minimum_per_order
+            > self.paper_brokerage_maximum_per_order
+        ):
+            raise ValueError("paper brokerage minimum cannot exceed maximum")
         return self
 
     @property

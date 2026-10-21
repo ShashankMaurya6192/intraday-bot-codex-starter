@@ -17,6 +17,7 @@ def test_cli_exposes_data_analysis_and_paper_only_commands() -> None:
         "paper-init",
         "paper-status",
         "paper-kill-switch",
+        "paper-report",
     )
 
     for command in commands:
@@ -36,6 +37,29 @@ def test_cli_exposes_data_analysis_and_paper_only_commands() -> None:
     assert "place-order" not in help_text
     assert "paper-fill" not in help_text
     assert "live-order" not in help_text
+
+
+def test_paper_report_has_no_data_until_a_session_is_initialized(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'empty-report.db').as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+
+    assert main(
+        [
+            "paper-report",
+            "--from-date",
+            "2026-08-10",
+            "--to-date",
+            "2026-08-11",
+            "--json",
+        ]
+    ) == 2
+
+    output = capsys.readouterr().out
+    assert '"status": "NO_DATA"' in output
+    assert '"broker_orders_available": false' in output
+    assert '"estimate_only": true' in output
 
 
 def test_paper_cli_initializes_reports_and_kills_without_broker_orders(

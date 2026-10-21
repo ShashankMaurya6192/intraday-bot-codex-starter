@@ -11,10 +11,13 @@ Durable candle completion follows same-instrument exchange-time progression;
 wall-clock-complete working buckets are read-only ephemeral views until that
 progression makes them stable.
 Phase 2.4 ranking and qualification semantics remain unchanged, and scanner
-results and qualified signals remain analysis only. Phase 3's first safe
-foundation adds a broker-free risk engine, persisted paper orders/positions,
-deterministic simulated fills, protective exits, restart recovery, and a paper
-kill switch. There is deliberately no automatic scanner-to-trade bridge and no
+results and qualified signals remain analysis only. Phase 3's safe foundation
+adds a broker-free risk engine, persisted paper orders/positions, deterministic
+simulated fills, protective exits, restart recovery, and a paper kill switch.
+A separate policy can convert a qualified candidate into an explicit local
+paper intent only after rechecking current breakout state, freshness,
+authoritative identity, same-day intraday eligibility, liquidity, and the
+initial stop. There is deliberately no automatic scanner-to-trade runner and no
 live order-placement code.
 
 No trading system can promise 100% accuracy. This project optimizes for
@@ -94,6 +97,7 @@ python -m trading_bot status
 python -m trading_bot init-db
 python -m trading_bot paper-init
 python -m trading_bot paper-status
+python -m trading_bot paper-report --from-date 2026-10-01 --to-date 2026-10-31
 ```
 
 If `py` is unavailable but `python --version` is 3.11 or newer, use:
@@ -113,10 +117,29 @@ PAPER_SLIPPAGE_BPS=5
 PAPER_TICK_PARTICIPATION_PCT=0.10
 PAPER_FIRST_PARTIAL_PCT=0.50
 PAPER_SECOND_PARTIAL_PCT=0.25
+PAPER_STOP_BUFFER_ATR=0.10
+PAPER_MINIMUM_STOP_TICKS=2
+PAPER_MAXIMUM_STOP_ATR=1.50
 ```
 
 These settings affect only local simulation. They do not create an Angel order
 path or relax the PAPER/LIVE gate.
+
+The checked-in estimated-cost defaults are decimal fractions, where `0.001`
+means 0.1%:
+
+```dotenv
+PAPER_COST_SCHEDULE_AS_OF=2026-10-21
+PAPER_BROKERAGE_RATE=0.001
+PAPER_BROKERAGE_MINIMUM_PER_ORDER=5
+PAPER_BROKERAGE_MAXIMUM_PER_ORDER=20
+PAPER_EXCHANGE_TRANSACTION_RATE=0.000030699
+PAPER_STT_SELL_RATE=0.00025
+PAPER_IPFT_RATE=0.000000001
+PAPER_SEBI_TURNOVER_RATE=0.000001
+PAPER_STAMP_DUTY_BUY_RATE=0.00003
+PAPER_GST_RATE=0.18
+```
 
 ## Reference-data refresh workflow
 
@@ -413,7 +436,10 @@ recorded SmartAPI ticks
   -> explainable analysis-only scanner rankings
   -> strict analysis-only signal qualification
 
-explicit paper trade intent (not automatically sourced from the scanner)
+qualified signal + independent strategy-to-paper policy
+  -> recheck current breakout, trusted freshness, identity, eligibility,
+     verified liquidity, and deterministic initial stop
+  -> explicit paper trade intent (not automatically submitted)
   -> fail-closed risk gates + risk/capital/liquidity sizing
   -> persisted local paper order
   -> later trusted tick + adverse-slippage/participation fill model
@@ -430,6 +456,7 @@ explicit paper trade intent (not automatically sourced from the scanner)
   replay, incremental projection, historical bootstrap, and market regime.
 - `trading_bot.indicators`: pure indicator functions with explicit warm-ups.
 - `trading_bot.scanner`: deterministic candidate scoring, diagnostics, and JSON.
+- `trading_bot.strategy`: broker-free qualified-signal to PAPER-intent policy.
 - `trading_bot.risk`: broker-neutral sizing and portfolio/day entry gates.
 - `trading_bot.paper`: broker-free paper order/fill/position state machine.
 - `trading_bot.storage`: raw ticks/feed events, projected health/references,
@@ -672,6 +699,8 @@ Initialize and inspect a paper session with explicit, local-only commands:
 python -m trading_bot paper-init
 python -m trading_bot paper-status
 python -m trading_bot paper-status --json
+python -m trading_bot paper-report --from-date 2026-10-01 --to-date 2026-10-31
+python -m trading_bot paper-report --from-date 2026-10-01 --to-date 2026-10-31 --json
 ```
 
 To test the operator kill switch, provide an auditable reason:
@@ -681,10 +710,11 @@ python -m trading_bot paper-kill-switch --reason "operator requested stop"
 python -m trading_bot paper-status
 ```
 
-For a historical test database session, every paper command also accepts
-`--date YYYY-MM-DD`. `paper-kill-switch` cancels pending paper entries and
-queues local exit simulations for open paper positions; it never transmits a
-broker order.
+For a historical test database session, `paper-init`, `paper-status`, and
+`paper-kill-switch` accept `--date YYYY-MM-DD`; `paper-report` accepts an
+inclusive `--from-date`/`--to-date` range. `paper-kill-switch` cancels pending
+paper entries and queues local exit simulations for open paper positions; it
+never transmits a broker order.
 
 The risk engine uses the configured starting equity rather than available
 leverage:
@@ -707,6 +737,19 @@ unverified funds or liquidity, entry-window violation, daily-loss limit,
 position/trade limits, consecutive-loss limit, kill switch, or uncertain state.
 Only one trade per instrument per session is allowed, preventing averaging down
 and same-symbol revenge re-entry.
+
+`RelativeStrengthOpeningBreakoutV1IntentPolicy` is the only implemented bridge
+from a qualified scanner candidate to a `PaperTradeIntent`. It does not submit
+the intent. It rechecks `READY`/fresh market data, the 09:30-14:45 window, exact
+cached instrument identity, normal NSE EQ status, the current intraday-allowed
+snapshot, a positive externally verified liquidity cap, and a completed trusted
+five-minute confirmation candle. LONG entry requires price to remain above the
+opening-range high; SHORT requires price to remain below the low. The initial
+stop uses `OPENING_RANGE_FAILURE_ATR_BUFFER_V1`: the failed-breakout boundary
+plus a configurable ATR buffer, rounded away from entry to the broker tick,
+with a minimum tick distance and maximum ATR distance. The first confirming
+candle anchors an idempotent client tag, preventing repeated scans from creating
+new signal identities.
 
 Paper fills use `NEXT_TRUSTED_TICK_ADVERSE_SLIPPAGE_V1`:
 
@@ -736,12 +779,25 @@ flat.
 SQLite persists the paper day, orders, fills, positions, marks, counters, kill
 switch, uncertainty flag, and audit events atomically. Restarting reopens the
 same pending/partial state rather than resetting limits or fabricating fills.
-Reported paper P&L is gross and explicitly excludes brokerage, STT, exchange
-charges, GST, stamp duty, and other fees; it must not be interpreted as net
-profitability until a reviewed Indian-equity cost model is added.
-The library surface for submitting explicit paper intents is intentionally not
-wired to scanner output yet: choosing a deterministic entry/stop policy and
-validating it across recorded sessions is the next correctness gate.
+`paper-status` retains the persisted simulator's gross P&L. `paper-report`
+adds a deterministic multi-session research report with closed-trade win rate,
+expectancy, net R, profit factor, closed-trade drawdown, rejected entries,
+unfinished exposure, and gross-versus-estimated-net P&L. Its configurable cost
+schedule estimates Angel One brokerage per executed order and NSE cash-intraday
+exchange charges, sell-side STT, IPFT, SEBI turnover fees, buy-side stamp duty,
+and GST. Defaults reflect the official [Angel One transaction-charge
+table](https://www.angelone.in/exchange-transaction-charges) and [NSE statutory
+levy table](https://www.nseindia.com/static/invest/first-time-investor-sebi-turnover-fees-stt-other-levies)
+reviewed on 2026-10-21. Output is explicitly
+`ESTIMATE_ONLY_NOT_A_CONTRACT_NOTE`: promotions, taxes, and broker/exchange
+rounding can change, so compare it with actual contract notes and update the
+`PAPER_*_RATE` settings before relying on results. Historical reports use the
+currently configured schedule and include its date/rates/source URLs; the rate
+snapshot is not yet frozen per session.
+
+The policy remains a library surface and is intentionally not wired to a
+continuous scanner loop. This prevents a qualified analytical row from silently
+becoming even a simulated order before replay validation and operator review.
 
 ## TLS, reconnect, and ingestion guarantees
 
@@ -773,15 +829,14 @@ Phase 2.5.4 and the paper engine remain local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 
-The next gate is not live trading. It is a deterministic strategy-to-paper
-intent policy that defines entry and initial stop prices without lookahead,
-then a single paper-session orchestrator that connects trusted projection
-updates to the already persisted simulator. That work also needs multi-session
-replay/backtest reporting, costs and gap scenarios, mark/reconciliation wiring
-for feed/queue/writer failures, and measured forward paper runs across multiple
-market regimes. Paper results must report win rate, expectancy, drawdown,
-slippage sensitivity, rejected signals, and uncertainty periods; none can prove
-future accuracy.
+The next gate is not live trading. It is an explicit replay-only harness for the
+new intent policy, followed by a reviewed paper-session orchestrator that
+connects trusted projection updates to the persisted simulator. It still needs
+slippage/cost sensitivity matrices, gap scenarios, frozen per-session cost
+snapshots, mark/reconciliation wiring for feed/queue/writer failures, sector
+confirmation, and measured forward paper runs across multiple market regimes.
+Reports must include rejected signals and uncertainty periods; no backtest or
+paper result can prove future accuracy.
 
 Live order placement, positions, order reconciliation, and any Angel order
 adapter remain absent. They must stay absent until the full acceptance gate in
