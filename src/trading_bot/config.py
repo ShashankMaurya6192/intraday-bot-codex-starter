@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import time
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -104,13 +105,27 @@ class Settings(BaseSettings):
     max_trades_per_day: int = Field(default=4, ge=1)
     max_consecutive_losses: int = Field(default=3, ge=1)
     max_capital_utilization_pct: Decimal = Field(default=Decimal("1.0"), gt=0, le=1)
+    paper_starting_equity: Decimal = Field(default=Decimal("1000000"), gt=0)
+    paper_entry_start_time: time = time(9, 30)
+    paper_last_entry_time: time = time(14, 45)
+    paper_square_off_time: time = time(15, 15)
+    paper_slippage_bps: Decimal = Field(default=Decimal("5"), ge=0, le=100)
+    paper_tick_participation_pct: Decimal = Field(
+        default=Decimal("0.10"), gt=0, le=1
+    )
+    paper_first_partial_pct: Decimal = Field(
+        default=Decimal("0.50"), ge=0, le=1
+    )
+    paper_second_partial_pct: Decimal = Field(
+        default=Decimal("0.25"), ge=0, le=1
+    )
 
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, value: str) -> str:
         value = value.strip()
         if not value.startswith("sqlite:///"):
-            raise ValueError("only sqlite:/// database URLs are supported in Phase 2")
+            raise ValueError("only sqlite:/// database URLs are supported")
         if not value.removeprefix("sqlite:///"):
             raise ValueError("database_url must include a SQLite path")
         return value
@@ -188,6 +203,26 @@ class Settings(BaseSettings):
         if self.scan_replay_warning_tick_count > self.scan_replay_hard_tick_limit:
             raise ValueError(
                 "scan replay warning tick count cannot exceed the hard tick limit"
+            )
+        if not (
+            self.paper_entry_start_time
+            < self.paper_last_entry_time
+            < self.paper_square_off_time
+        ):
+            raise ValueError(
+                "paper entry start, last entry, and square-off times must increase"
+            )
+        if self.paper_entry_start_time < time(9, 30):
+            raise ValueError("paper entries cannot begin before 09:30 IST")
+        if self.paper_last_entry_time > time(14, 45):
+            raise ValueError("paper entries cannot continue after 14:45 IST")
+        if self.paper_square_off_time >= time(15, 30):
+            raise ValueError("paper square-off must be before 15:30 IST")
+        if self.paper_first_partial_pct + self.paper_second_partial_pct > 1:
+            raise ValueError("paper partial-exit percentages cannot exceed 100%")
+        if self.paper_first_partial_pct == 0 and self.paper_second_partial_pct > 0:
+            raise ValueError(
+                "paper second partial requires a non-zero first partial"
             )
         return self
 

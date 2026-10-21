@@ -1,6 +1,6 @@
 """Broker boundaries for authentication and market data only.
 
-Order placement intentionally does not exist in the Phase 2 interfaces.
+Order placement intentionally does not exist in this paper-only build.
 """
 
 from __future__ import annotations

@@ -11,8 +11,15 @@ Durable candle completion follows same-instrument exchange-time progression;
 wall-clock-complete working buckets are read-only ephemeral views until that
 progression makes them stable.
 Phase 2.4 ranking and qualification semantics remain unchanged, and scanner
-results and qualified signals remain analysis only.
-There is no paper execution, order interface, or live order-placement code.
+results and qualified signals remain analysis only. Phase 3's first safe
+foundation adds a broker-free risk engine, persisted paper orders/positions,
+deterministic simulated fills, protective exits, restart recovery, and a paper
+kill switch. There is deliberately no automatic scanner-to-trade bridge and no
+live order-placement code.
+
+No trading system can promise 100% accuracy. This project optimizes for
+repeatable decisions, bounded loss, conservative simulation, and refusing to
+trade when state is uncertain—not a guaranteed win rate.
 
 ## Safety status
 
@@ -23,6 +30,13 @@ There is no paper execution, order interface, or live order-placement code.
 - The Angel adapter can authenticate, read live/historical market data, and read
   the official intraday-allowed list. It cannot place, modify, cancel, or query
   orders.
+- Paper orders are local SQLite records only. A paper fill is never represented
+  as an Angel/broker fill.
+- New paper entries require a qualified signal flag, trusted data, a valid hard
+  stop, verified simulated funds/liquidity, and every configured risk limit.
+- A stale/untrusted tick affecting exposure, a queue/writer failure reported to
+  the paper engine, or uncertain state cancels pending entries and blocks new
+  ones. Exits are never fabricated without a trusted tick.
 - The production WebSocket verifies certificates and hostnames.
 - Reconnects, downloads, queues, and shutdown drains are bounded.
 - Missing, stale, corrupt, ambiguous, timestamp-disordered, or incomplete data
@@ -78,6 +92,8 @@ python -m pytest -q
 python -m ruff check .
 python -m trading_bot status
 python -m trading_bot init-db
+python -m trading_bot paper-init
+python -m trading_bot paper-status
 ```
 
 If `py` is unavailable but `python --version` is 3.11 or newer, use:
@@ -85,6 +101,22 @@ If `py` is unavailable but `python --version` is 3.11 or newer, use:
 ```powershell
 python -m venv .venv
 ```
+
+The default paper account and simulation controls are:
+
+```dotenv
+PAPER_STARTING_EQUITY=1000000
+PAPER_ENTRY_START_TIME=09:30:00
+PAPER_LAST_ENTRY_TIME=14:45:00
+PAPER_SQUARE_OFF_TIME=15:15:00
+PAPER_SLIPPAGE_BPS=5
+PAPER_TICK_PARTICIPATION_PCT=0.10
+PAPER_FIRST_PARTIAL_PCT=0.50
+PAPER_SECOND_PARTIAL_PCT=0.25
+```
+
+These settings affect only local simulation. They do not create an Angel order
+path or relax the PAPER/LIVE gate.
 
 ## Reference-data refresh workflow
 
@@ -352,7 +384,7 @@ SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
 An unmapped, ambiguous, non-NIFTY-500, or non-intraday-allowed symbol is excluded
 with a diagnostic rather than assigned a guessed token.
 
-## Phase 2.5.4 architecture
+## Market-intelligence and paper architecture
 
 ```text
 explicit refresh commands
@@ -380,6 +412,13 @@ recorded SmartAPI ticks
   -> replay-safe indicators + NIFTY regime
   -> explainable analysis-only scanner rankings
   -> strict analysis-only signal qualification
+
+explicit paper trade intent (not automatically sourced from the scanner)
+  -> fail-closed risk gates + risk/capital/liquidity sizing
+  -> persisted local paper order
+  -> later trusted tick + adverse-slippage/participation fill model
+  -> persisted paper position + hard stop/partials/time exit
+  -> daily limits + kill switch + restart-safe audit state
 ```
 
 - `trading_bot.reference_data`: atomic cache metadata, bounded verified-HTTPS
@@ -391,8 +430,11 @@ recorded SmartAPI ticks
   replay, incremental projection, historical bootstrap, and market regime.
 - `trading_bot.indicators`: pure indicator functions with explicit warm-ups.
 - `trading_bot.scanner`: deterministic candidate scoring, diagnostics, and JSON.
+- `trading_bot.risk`: broker-neutral sizing and portfolio/day entry gates.
+- `trading_bot.paper`: broker-free paper order/fill/position state machine.
 - `trading_bot.storage`: raw ticks/feed events, projected health/references,
-  projection checkpoints, candles, and RVOL baselines in SQLite.
+  projection checkpoints, candles, RVOL baselines, and paper audit state in
+  SQLite.
 
 ## Incremental projection and restart safety
 
@@ -622,6 +664,85 @@ Qualification reasons are emitted in stable gate order, including
 `vwap_atr_extension_exceeded`. Sector remains `None`; sector confirmation is a
 future enhancement until authoritative sector/index mapping is implemented.
 
+## Paper risk and execution foundation
+
+Initialize and inspect a paper session with explicit, local-only commands:
+
+```powershell
+python -m trading_bot paper-init
+python -m trading_bot paper-status
+python -m trading_bot paper-status --json
+```
+
+To test the operator kill switch, provide an auditable reason:
+
+```powershell
+python -m trading_bot paper-kill-switch --reason "operator requested stop"
+python -m trading_bot paper-status
+```
+
+For a historical test database session, every paper command also accepts
+`--date YYYY-MM-DD`. `paper-kill-switch` cancels pending paper entries and
+queues local exit simulations for open paper positions; it never transmits a
+broker order.
+
+The risk engine uses the configured starting equity rather than available
+leverage:
+
+```text
+risk_equity = min(starting_equity, current_equity)
+risk_budget = risk_equity * risk_per_trade_pct
+risk_per_share = abs(planned_entry - protective_stop)
+qty_by_risk = floor(risk_budget / risk_per_share)
+final_qty = min(risk_qty, cash/capital_qty, verified_liquidity_qty)
+```
+
+Profits never increase the session's sizing base, while realized/unrealized
+losses reduce it. The final quantity is rounded down to the instrument lot
+size. Full notional is reserved for both long and short paper positions, so
+broker leverage can never increase planned rupee risk. New entries fail closed
+on an invalid/zero stop,
+unqualified signal, untrusted market data, stale marks on existing positions,
+unverified funds or liquidity, entry-window violation, daily-loss limit,
+position/trade limits, consecutive-loss limit, kill switch, or uncertain state.
+Only one trade per instrument per session is allowed, preventing averaging down
+and same-symbol revenge re-entry.
+
+Paper fills use `NEXT_TRUSTED_TICK_ADVERSE_SLIPPAGE_V1`:
+
+- an order cannot fill on the tick/time that created it;
+- only a later `READY`, fresh exchange/receive timestamp tick may fill it;
+- missing or zero last-traded quantity produces no fill;
+- fill size is capped by `last_traded_quantity *
+  PAPER_TICK_PARTICIPATION_PCT` and the remaining order quantity;
+- buy prices round up and sell prices round down after configured adverse
+  slippage;
+- if that simulated entry price would exceed the original per-share risk or
+  capital plan, the unfilled entry quantity is cancelled instead of increasing
+  risk;
+- a deterministic tick/order fill identity prevents a replay or restart from
+  duplicating a fill.
+
+Every accepted entry has a persisted hard stop. The simulator can take the
+configured partial at +1R, the second partial at +1.5R, accept only
+risk-tightening stop updates, and queue a time exit at 15:15 IST by default.
+Triggers create an exit that can fill only from a later trusted tick, making gap
+and latency risk visible instead of granting an optimistic trigger-price fill.
+If data becomes unsafe while exposure exists, the day becomes
+`STATE_UNCERTAIN`; pending entries are cancelled, new entries stop, and no exit
+fill is invented. Uncertainty can be cleared only when the local paper state is
+flat.
+
+SQLite persists the paper day, orders, fills, positions, marks, counters, kill
+switch, uncertainty flag, and audit events atomically. Restarting reopens the
+same pending/partial state rather than resetting limits or fabricating fills.
+Reported paper P&L is gross and explicitly excludes brokerage, STT, exchange
+charges, GST, stamp duty, and other fees; it must not be interpreted as net
+profitability until a reviewed Indian-equity cost model is added.
+The library surface for submitting explicit paper intents is intentionally not
+wired to scanner output yet: choosing a deterministic entry/stop policy and
+validating it across recorded sessions is the next correctness gate.
+
 ## TLS, reconnect, and ingestion guarantees
 
 The project pins `smartapi-python==1.5.5`. That SDK's WebSocket `connect()` uses
@@ -642,20 +763,29 @@ unsafe and stops it.
 `windows-latest`, installing `.[dev]`, running Ruff, and running the complete
 credential-free pytest suite.
 
-## Phase 3 remains unimplemented
+## Current boundary and next correctness gate
 
 Normal as-of scans load prior historical candles plus one read-only current
 projection snapshot; they do not count or replay the full raw-tick day. The raw
 replay hard limit and timing fields remain for explicit
 `replay`/projection-comparison diagnostics and backward-compatible output.
-Phase 2.5.4 is still local SQLite architecture: large
+Phase 2.5.4 and the paper engine remain local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 
-Phase 3 may add deterministic paper execution, fill simulation assumptions,
-position/risk state, protective exits, restart recovery, and kill-switch tests.
-It must not enable live orders. Phase 2 scanner output first needs validation
-across multiple recorded/replayed sessions, including reconnects, timestamp
-regressions, and cache refresh operations.
+The next gate is not live trading. It is a deterministic strategy-to-paper
+intent policy that defines entry and initial stop prices without lookahead,
+then a single paper-session orchestrator that connects trusted projection
+updates to the already persisted simulator. That work also needs multi-session
+replay/backtest reporting, costs and gap scenarios, mark/reconciliation wiring
+for feed/queue/writer failures, and measured forward paper runs across multiple
+market regimes. Paper results must report win rate, expectancy, drawdown,
+slippage sensitivity, rejected signals, and uncertainty periods; none can prove
+future accuracy.
+
+Live order placement, positions, order reconciliation, and any Angel order
+adapter remain absent. They must stay absent until the full acceptance gate in
+`AGENTS.md` is met and the user explicitly chooses to begin a separately
+reviewed live-order phase.
 
 See `AGENTS.md` for the full engineering and real-money safety contract.

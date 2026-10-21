@@ -29,6 +29,7 @@ from .marketdata import (
     YFinanceHistoricalProvider,
     run_historical_diagnostic,
 )
+from .paper import PaperExecutionConfig, PaperExecutionEngine
 from .reference_data import (
     NIFTY500_CONSTITUENTS_URL,
     Nifty500Cache,
@@ -40,10 +41,12 @@ from .reference_data.universe import (
     resolve_nse_equity_mappings,
     resolve_nse_equity_universe,
 )
+from .risk import RiskLimits
 from .scanner import MarketScanner, ScannerWeights
 from .storage import (
     ProjectionMarketDataWriter,
     SQLiteMarketRecorder,
+    SQLitePaperStore,
     TickIngestionService,
 )
 
@@ -51,10 +54,10 @@ from .storage import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trading_bot",
-        description="Paper-first Angel One market intelligence (analysis only)",
+        description="Paper-first Angel One market intelligence and simulation",
     )
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("status", help="show redacted Phase 2 configuration status")
+    subparsers.add_parser("status", help="show redacted safety configuration status")
     subparsers.add_parser("init-db", help="create or migrate the SQLite recorder")
     subparsers.add_parser(
         "record-market",
@@ -122,6 +125,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--date", required=True, type=_iso_date)
     compare.add_argument("--json", action="store_true", dest="json_output")
+    paper_init = subparsers.add_parser(
+        "paper-init",
+        help="initialize persisted PAPER risk state for an IST session",
+    )
+    paper_init.add_argument("--date", type=_iso_date)
+    paper_status = subparsers.add_parser(
+        "paper-status",
+        help="show persisted PAPER orders, fills, positions, and risk state",
+    )
+    paper_status.add_argument("--date", type=_iso_date)
+    paper_status.add_argument("--json", action="store_true", dest="json_output")
+    paper_kill = subparsers.add_parser(
+        "paper-kill-switch",
+        help="block PAPER entries and queue exits for open PAPER positions",
+    )
+    paper_kill.add_argument("--date", type=_iso_date)
+    paper_kill.add_argument("--reason", required=True)
     return parser
 
 
@@ -129,14 +149,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = Settings()
 
-    # Phase 2 intentionally has no explicit-live confirmation path. Any LIVE
+    # This build intentionally has no explicit-live confirmation path. Any LIVE
     # configuration therefore fails closed before a command runs.
     settings.assert_live_allowed()
     command = args.command or "status"
 
     if command == "status":
         subscriptions = settings.market_subscriptions()
-        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=2.5.4")
+        print(f"Intraday Bot | mode={settings.trading_mode.value} | phase=3-paper")
         print(f"Angel credentials configured={settings.angel_credentials_configured}")
         print(f"Market subscriptions={len(subscriptions)}")
         print(f"Scanner symbol override={len(settings.configured_scanner_symbols())}")
@@ -149,12 +169,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{settings.scanner_projection_stale_after_seconds}"
         )
         print("Scanner output=ANALYSIS_ONLY")
-        print("Paper execution available=False")
+        print("Paper execution engine available=True")
+        print("Automated signal-to-paper runner available=False")
         print("Order placement available=False")
         return 0
 
     if command == "init-db":
         with _recorder(settings):
+            pass
+        with _paper_store(settings):
             pass
         print(f"Initialized SQLite market recorder at {settings.database_url}")
         return 0
@@ -237,7 +260,146 @@ def main(argv: Sequence[str] | None = None) -> int:
             json_output=args.json_output,
         )
 
+    if command == "paper-init":
+        return _paper_init(settings, session_date=args.date)
+
+    if command == "paper-status":
+        return _paper_status(
+            settings,
+            session_date=args.date,
+            json_output=args.json_output,
+        )
+
+    if command == "paper-kill-switch":
+        return _paper_kill_switch(
+            settings,
+            session_date=args.date,
+            reason=args.reason,
+        )
+
     raise AssertionError(f"unhandled command: {command}")
+
+
+def _paper_init(settings: Settings, *, session_date: date | None) -> int:
+    now = datetime.now(IST)
+    selected_date = session_date or now.date()
+    if selected_date != now.date():
+        now = datetime.combine(selected_date, time(9, 15), tzinfo=IST)
+    with _paper_store(settings) as store:
+        day = _paper_engine(settings, store).initialize_day(
+            selected_date,
+            starting_equity=settings.paper_starting_equity,
+            now=now,
+        )
+    print(
+        "Initialized PAPER session "
+        f"date={day.session_date.isoformat()} "
+        f"starting_equity={day.starting_equity}"
+    )
+    print("No broker order was created or transmitted.")
+    return 0
+
+
+def _paper_status(
+    settings: Settings,
+    *,
+    session_date: date | None,
+    json_output: bool,
+) -> int:
+    selected_date = session_date or datetime.now(IST).date()
+    with _paper_store(settings) as store:
+        day = store.load_day(selected_date)
+        orders = store.list_orders(selected_date)
+        fills = store.list_fills(selected_date)
+        positions = store.list_positions(selected_date)
+        audit_events = store.list_audit_events(selected_date)
+    if day is None:
+        payload: dict[str, object] = {
+            "status": "NOT_INITIALIZED",
+            "session_date": selected_date.isoformat(),
+            "mode": "PAPER",
+            "broker_orders_available": False,
+        }
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(
+                f"PAPER session {selected_date.isoformat()} is not initialized."
+            )
+        return 2
+    if day.state_uncertain:
+        paper_status = "STATE_UNCERTAIN"
+    elif day.kill_switch_active:
+        paper_status = "KILL_SWITCH_ACTIVE"
+    else:
+        paper_status = "READY"
+    payload = {
+        "status": paper_status,
+        "session_date": selected_date.isoformat(),
+        "mode": "PAPER",
+        "starting_equity": str(day.starting_equity),
+        "realized_pnl": str(day.realized_pnl),
+        "capital_reserved": str(day.capital_reserved),
+        "pnl_basis": "GROSS_EXCLUDING_FEES_AND_TAXES",
+        "trade_count": day.trade_count,
+        "consecutive_losses": day.consecutive_losses,
+        "kill_switch_active": day.kill_switch_active,
+        "state_uncertain": day.state_uncertain,
+        "order_count": len(orders),
+        "active_order_count": sum(item.active for item in orders),
+        "fill_count": len(fills),
+        "open_position_count": sum(
+            item.status.value == "OPEN" for item in positions
+        ),
+        "audit_event_count": len(audit_events),
+        "broker_orders_available": False,
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"PAPER status={payload['status']} date={selected_date.isoformat()} "
+            f"realized_pnl={day.realized_pnl} "
+            f"capital_reserved={day.capital_reserved}"
+        )
+        print("pnl_basis=GROSS_EXCLUDING_FEES_AND_TAXES")
+        print(
+            f"trades={day.trade_count} active_orders={payload['active_order_count']} "
+            f"fills={len(fills)} open_positions={payload['open_position_count']}"
+        )
+        print(
+            f"kill_switch={day.kill_switch_active} "
+            f"state_uncertain={day.state_uncertain} broker_orders=False"
+        )
+    return 0 if paper_status == "READY" else 2
+
+
+def _paper_kill_switch(
+    settings: Settings,
+    *,
+    session_date: date | None,
+    reason: str,
+) -> int:
+    now = datetime.now(IST)
+    selected_date = session_date or now.date()
+    if selected_date != now.date():
+        now = datetime.combine(selected_date, time(15, 0), tzinfo=IST)
+    with _paper_store(settings) as store:
+        day = _paper_engine(settings, store).activate_kill_switch(
+            selected_date,
+            now=now,
+            reason=reason,
+        )
+        queued_exits = sum(
+            order.active and order.purpose.value == "KILL_SWITCH_EXIT"
+            for order in store.list_orders(selected_date)
+        )
+    print(
+        f"PAPER kill switch active={day.kill_switch_active} "
+        f"queued_exits={queued_exits}"
+    )
+    print("No broker order was created or transmitted.")
+    return 0
 
 
 def _record_market(settings: Settings) -> int:
@@ -1407,6 +1569,41 @@ def _recorder(settings: Settings) -> SQLiteMarketRecorder:
     return SQLiteMarketRecorder(
         settings.database_url,
         busy_timeout_ms=settings.database_busy_timeout_ms,
+    )
+
+
+def _paper_store(settings: Settings) -> SQLitePaperStore:
+    return SQLitePaperStore(
+        settings.database_url,
+        busy_timeout_ms=settings.database_busy_timeout_ms,
+    )
+
+
+def _paper_engine(
+    settings: Settings, store: SQLitePaperStore
+) -> PaperExecutionEngine:
+    return PaperExecutionEngine(
+        store,
+        RiskLimits(
+            risk_per_trade_pct=settings.risk_per_trade_pct,
+            max_daily_loss_pct=settings.max_daily_loss_pct,
+            max_open_positions=settings.max_open_positions,
+            max_trades_per_day=settings.max_trades_per_day,
+            max_consecutive_losses=settings.max_consecutive_losses,
+            max_capital_utilization_pct=(
+                settings.max_capital_utilization_pct
+            ),
+        ),
+        config=PaperExecutionConfig(
+            slippage_bps=settings.paper_slippage_bps,
+            tick_participation_pct=settings.paper_tick_participation_pct,
+            first_partial_pct=settings.paper_first_partial_pct,
+            second_partial_pct=settings.paper_second_partial_pct,
+            square_off_time=settings.paper_square_off_time,
+            stale_after_seconds=settings.market_data_stale_after_seconds,
+        ),
+        entry_start=settings.paper_entry_start_time,
+        last_entry=settings.paper_last_entry_time,
     )
 
 

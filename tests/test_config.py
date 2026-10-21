@@ -1,3 +1,4 @@
+from datetime import time
 from decimal import Decimal
 
 import pytest
@@ -24,6 +25,12 @@ def test_default_is_paper() -> None:
     assert settings.historical_bootstrap_minimum_sessions == 15
     assert settings.scan_replay_hard_tick_limit == 2_000_000
     assert settings.scanner_projection_stale_after_seconds == 5
+    assert settings.paper_starting_equity == Decimal("1000000")
+    assert settings.paper_entry_start_time == time(9, 30)
+    assert settings.paper_last_entry_time == time(14, 45)
+    assert settings.paper_square_off_time == time(15, 15)
+    assert settings.paper_slippage_bps == Decimal("5")
+    assert settings.paper_tick_participation_pct == Decimal("0.10")
     assert not hasattr(settings, "market_data_allowed_sequence_gap")
     assert settings.configured_scanner_symbols() == ()
 
@@ -126,3 +133,28 @@ def test_scanner_symbol_override_and_rvol_warmup_are_validated() -> None:
 def test_projection_freshness_bound_is_positive() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, scanner_projection_stale_after_seconds=0)
+
+
+def test_paper_times_and_partial_percentages_are_validated() -> None:
+    with pytest.raises(ValidationError, match="times must increase"):
+        Settings(
+            _env_file=None,
+            paper_last_entry_time="15:20",
+            paper_square_off_time="15:15",
+        )
+
+    with pytest.raises(ValidationError, match="partial-exit"):
+        Settings(
+            _env_file=None,
+            paper_first_partial_pct="0.8",
+            paper_second_partial_pct="0.3",
+        )
+
+    with pytest.raises(ValidationError, match="before 09:30"):
+        Settings(_env_file=None, paper_entry_start_time="09:29")
+
+    with pytest.raises(ValidationError, match="after 14:45"):
+        Settings(_env_file=None, paper_last_entry_time="14:46")
+
+    with pytest.raises(ValidationError, match="before 15:30"):
+        Settings(_env_file=None, paper_square_off_time="15:30")
