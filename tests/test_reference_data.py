@@ -206,6 +206,36 @@ def test_nifty_cache_atomic_mapping_and_diagnostics(tmp_path) -> None:
     }
 
 
+def test_nifty_cache_validates_but_excludes_recognized_non_normal_series(
+    tmp_path,
+) -> None:
+    path = tmp_path / "nifty.json"
+    cache = Nifty500Cache(path, max_age_seconds=3600)
+    payload = (
+        b"Company Name,Industry,Symbol,Series,ISIN Code\n"
+        b"ABC Limited,Test,ABC,EQ,INE000000001\n"
+        b"Example REIT,Realty,REIT,RR,INE000000002\n"
+        b"Trade to Trade Limited,Test,BEONLY,BE,INE000000003\n"
+    )
+
+    assert (
+        cache.refresh(source="fixture.csv", source_bytes=payload, fetched_at=NOW)
+        == 1
+    )
+    assert cache.metadata.record_count == 1
+    assert cache.metadata.source_record_count == 3
+    assert [item.symbol for item in cache.constituents] == ["ABC"]
+    last_known_good = path.read_bytes()
+
+    with pytest.raises(Nifty500CacheError, match="unsupported Series"):
+        cache.refresh(
+            source="fixture.csv",
+            source_bytes=payload.replace(b",RR,", b",UNKNOWN,"),
+            fetched_at=NOW + timedelta(minutes=1),
+        )
+    assert path.read_bytes() == last_known_good
+
+
 def test_ambiguous_nifty_mapping_is_excluded_without_guessing(tmp_path) -> None:
     nifty = Nifty500Cache(tmp_path / "nifty.json", max_age_seconds=3600)
     nifty.refresh(source="fixture.csv", source_bytes=_nifty_csv("ABC"), fetched_at=NOW)

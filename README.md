@@ -168,7 +168,10 @@ python -m trading_bot data-status --json
   increase strategy risk.
 - `refresh-nifty500` downloads the CSV linked by the current NSE NIFTY 500
   product page from `nsearchives.nseindia.com`, with
-  `archives.nseindia.com` as an official HTTPS fallback.
+  `archives.nseindia.com` as an official HTTPS fallback. Every source row is
+  validated and counted; recognized non-normal `BE` and REIT `RR` series are
+  deliberately excluded from the normal-equity scanner. Any unknown series
+  still fails the refresh closed.
 
 If the NSE Indices host is unavailable, download the authoritative CSV and use
 the explicit local import path:

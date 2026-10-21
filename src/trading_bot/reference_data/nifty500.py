@@ -30,6 +30,7 @@ NIFTY500_OFFICIAL_FALLBACK_URL = (
 _SCHEMA_VERSION = 1
 _MAX_DOWNLOAD_BYTES = 5_000_000
 _REQUIRED_COLUMNS = {"Company Name", "Industry", "Symbol", "Series", "ISIN Code"}
+_NON_NORMAL_SERIES = frozenset({"BE", "RR"})
 _OFFICIAL_HTTPS_HOSTS = {
     "nsearchives.nseindia.com",
     "archives.nseindia.com",
@@ -149,7 +150,7 @@ class Nifty500Cache:
                     raise Nifty500CacheError(
                         "NIFTY 500 import source is unavailable"
                     ) from exc
-        constituents = _parse_csv(payload)
+        constituents, source_record_count = _parse_csv(payload)
         records = [item.to_cache_record() for item in constituents]
         timestamp = _aware(fetched_at or datetime.now(IST))
         metadata = make_metadata(
@@ -158,6 +159,7 @@ class Nifty500Cache:
             source_url=actual_source,
             schema_version=_SCHEMA_VERSION,
             records=records,
+            source_record_count=source_record_count,
         )
         write_atomic_cache(self.cache_path, metadata=metadata, records=records)
         self._install(metadata, constituents)
@@ -173,6 +175,11 @@ class Nifty500Cache:
             metadata, rows = read_cache_document(self.cache_path)
             if metadata.schema_version != _SCHEMA_VERSION:
                 raise ReferenceDataError("unsupported NIFTY 500 cache schema")
+            if (
+                metadata.source_record_count is None
+                or metadata.source_record_count < metadata.record_count
+            ):
+                raise ReferenceDataError("invalid NIFTY 500 source record count")
             if require_current:
                 require_fresh(
                     metadata,
@@ -195,7 +202,7 @@ class Nifty500Cache:
         self._constituents = tuple(sorted(constituents, key=lambda item: item.symbol))
 
 
-def _parse_csv(payload: bytes) -> list[NiftyConstituent]:
+def _parse_csv(payload: bytes) -> tuple[list[NiftyConstituent], int]:
     try:
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -204,23 +211,50 @@ def _parse_csv(payload: bytes) -> list[NiftyConstituent]:
     if reader.fieldnames is None or not _REQUIRED_COLUMNS.issubset(reader.fieldnames):
         raise Nifty500CacheError("NIFTY 500 CSV has an unexpected schema")
     constituents: list[NiftyConstituent] = []
+    source_symbols: set[str] = set()
+    source_isins: set[str] = set()
+    source_record_count = 0
     for index, row in enumerate(reader, start=2):
+        source_record_count += 1
         try:
-            constituents.append(
-                NiftyConstituent(
-                    company_name=row["Company Name"],
-                    industry=row["Industry"],
-                    symbol=row["Symbol"],
-                    series=row["Series"],
-                    isin=row["ISIN Code"],
-                )
-            )
+            company_name, industry, symbol, series, isin = _source_fields(row)
         except (KeyError, ValueError, AttributeError) as exc:
             raise Nifty500CacheError(f"NIFTY 500 CSV row {index} is malformed") from exc
+        if symbol in source_symbols or isin in source_isins:
+            raise Nifty500CacheError(
+                "NIFTY 500 data contains a duplicate authoritative identity"
+            )
+        source_symbols.add(symbol)
+        source_isins.add(isin)
+        if series == "EQ":
+            constituents.append(
+                NiftyConstituent(
+                    company_name=company_name,
+                    industry=industry,
+                    symbol=symbol,
+                    series=series,
+                    isin=isin,
+                )
+            )
+        elif series not in _NON_NORMAL_SERIES:
+            raise Nifty500CacheError(
+                f"NIFTY 500 CSV row {index} has unsupported Series {series!r}"
+            )
     if not constituents:
-        raise Nifty500CacheError("NIFTY 500 CSV has no constituents")
+        raise Nifty500CacheError("NIFTY 500 CSV has no normal EQ constituents")
     _validate_unique(constituents)
-    return constituents
+    return constituents, source_record_count
+
+
+def _source_fields(row: dict[str, str]) -> tuple[str, str, str, str, str]:
+    values = tuple(
+        row[field].strip()
+        for field in ("Company Name", "Industry", "Symbol", "Series", "ISIN Code")
+    )
+    if any(not value for value in values):
+        raise ValueError("source fields must not be blank")
+    company_name, industry, symbol, series, isin = values
+    return company_name, industry, symbol.upper(), series.upper(), isin.upper()
 
 
 def _from_cache(row: object) -> NiftyConstituent:

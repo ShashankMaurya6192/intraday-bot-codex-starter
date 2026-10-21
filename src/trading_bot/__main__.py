@@ -248,7 +248,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         cache = _nifty500_cache(settings)
         count = cache.refresh(source=args.source)
         print(
-            f"Refreshed NIFTY 500 constituents: records={count} "
+            f"Refreshed NIFTY 500 constituents: equity_records={count} "
+            f"source_records={cache.metadata.source_record_count} "
             f"sha256={cache.metadata.sha256} cache={cache.cache_path}"
         )
         return 0
