@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -11,6 +12,10 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import unquote
 
+from trading_bot.backtest.reference import (
+    ReplayReferenceSnapshot,
+    ReplayReferenceSnapshotError,
+)
 from trading_bot.broker.instruments import BrokerInstrument
 from trading_bot.domain import (
     IST,
@@ -189,6 +194,13 @@ CREATE TABLE IF NOT EXISTS market_projection_checkpoint (
     state_version INTEGER NOT NULL CHECK (state_version > 0),
     state_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS replay_reference_snapshots (
+    session_date TEXT PRIMARY KEY,
+    captured_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL
+);
 """
 
 
@@ -291,6 +303,13 @@ class SQLiteMarketRecorder:
                 VALUES (?, ?)
                 """,
                 (6, datetime.now(IST).isoformat()),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_version(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (7, datetime.now(IST).isoformat()),
             )
             self._connection.commit()
 
@@ -486,6 +505,56 @@ class SQLiteMarketRecorder:
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
         return [_row_to_candle(row) for row in rows]
+
+    def save_replay_reference_snapshot(
+        self, snapshot: ReplayReferenceSnapshot
+    ) -> ReplayReferenceSnapshot:
+        """Insert one immutable semantic snapshot, tolerating identical restarts."""
+        payload_json = snapshot.payload_json
+        payload_sha256 = snapshot.payload_sha256
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT * FROM replay_reference_snapshots WHERE session_date = ?
+                """,
+                (snapshot.session_date.isoformat(),),
+            ).fetchone()
+            if row is not None:
+                existing = _row_to_replay_reference_snapshot(row)
+                if (
+                    existing.payload_sha256 != payload_sha256
+                    or existing.payload_json != payload_json
+                ):
+                    raise ReplayReferenceSnapshotError(
+                        "session reference snapshot conflicts with its first capture"
+                    )
+                return existing
+            self._connection.execute(
+                """
+                INSERT INTO replay_reference_snapshots(
+                    session_date, captured_at, payload_json, payload_sha256
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    snapshot.session_date.isoformat(),
+                    snapshot.captured_at.isoformat(),
+                    payload_json,
+                    payload_sha256,
+                ),
+            )
+        return snapshot
+
+    def load_replay_reference_snapshot(
+        self, session_date: date
+    ) -> ReplayReferenceSnapshot | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM replay_reference_snapshots WHERE session_date = ?
+                """,
+                (session_date.isoformat(),),
+            ).fetchone()
+        return None if row is None else _row_to_replay_reference_snapshot(row)
 
     def record_volume_baseline_session(
         self,
@@ -1498,6 +1567,34 @@ def _row_to_session_reference(row: sqlite3.Row) -> SessionReference:
         provenance=MarketDataProvenance(row["provenance"]),
         trusted=bool(row["trusted"]),
     )
+
+
+def _row_to_replay_reference_snapshot(
+    row: sqlite3.Row,
+) -> ReplayReferenceSnapshot:
+    payload_json = str(row["payload_json"])
+    expected_sha256 = str(row["payload_sha256"])
+    actual_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ReplayReferenceSnapshotError(
+            "replay reference snapshot checksum does not match its payload"
+        )
+    try:
+        payload = json.loads(payload_json)
+        snapshot = ReplayReferenceSnapshot.from_payload(
+            session_date=date.fromisoformat(row["session_date"]),
+            captured_at=datetime.fromisoformat(row["captured_at"]),
+            payload=payload,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReplayReferenceSnapshotError(
+            "replay reference snapshot row is corrupt"
+        ) from exc
+    if snapshot.payload_json != payload_json:
+        raise ReplayReferenceSnapshotError(
+            "replay reference snapshot payload is not canonical"
+        )
+    return snapshot
 
 
 def _ensure_column(

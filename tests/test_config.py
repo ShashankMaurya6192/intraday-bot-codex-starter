@@ -36,6 +36,9 @@ def test_default_is_paper() -> None:
     assert settings.paper_maximum_stop_atr == Decimal("1.50")
     assert settings.paper_brokerage_rate == Decimal("0.001")
     assert settings.paper_stt_sell_rate == Decimal("0.00025")
+    assert settings.paper_replay_max_ticks == 250_000
+    assert settings.paper_replay_max_instruments == 20
+    assert settings.paper_replay_liquidity_participation_pct == Decimal("0.10")
     assert not hasattr(settings, "market_data_allowed_sequence_gap")
     assert settings.configured_scanner_symbols() == ()
 

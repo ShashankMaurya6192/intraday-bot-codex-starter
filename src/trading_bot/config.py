@@ -148,6 +148,11 @@ class Settings(BaseSettings):
         default=Decimal("0.00003"), ge=0, le=1
     )
     paper_gst_rate: Decimal = Field(default=Decimal("0.18"), ge=0, le=1)
+    paper_replay_max_ticks: int = Field(default=250_000, ge=1, le=2_000_000)
+    paper_replay_max_instruments: int = Field(default=20, ge=1, le=100)
+    paper_replay_liquidity_participation_pct: Decimal = Field(
+        default=Decimal("0.10"), gt=0, le=1
+    )
 
     @field_validator("database_url")
     @classmethod

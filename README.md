@@ -17,8 +17,10 @@ simulated fills, protective exits, restart recovery, and a paper kill switch.
 A separate policy can convert a qualified candidate into an explicit local
 paper intent only after rechecking current breakout state, freshness,
 authoritative identity, same-day intraday eligibility, liquidity, and the
-initial stop. There is deliberately no automatic scanner-to-trade runner and no
-live order-placement code.
+initial stop. An explicit replay-only harness can exercise that policy and the
+paper simulator against recorded ticks using immutable same-session reference
+data and isolated in-memory paper accounts. There is deliberately no automatic
+scanner-to-trade runner and no live order-placement code.
 
 No trading system can promise 100% accuracy. This project optimizes for
 repeatable decisions, bounded loss, conservative simulation, and refusing to
@@ -98,6 +100,7 @@ python -m trading_bot init-db
 python -m trading_bot paper-init
 python -m trading_bot paper-status
 python -m trading_bot paper-report --from-date 2026-10-01 --to-date 2026-10-31
+python -m trading_bot paper-replay --date 2026-10-20 --json
 ```
 
 If `py` is unavailable but `python --version` is 3.11 or newer, use:
@@ -139,6 +142,9 @@ PAPER_IPFT_RATE=0.000000001
 PAPER_SEBI_TURNOVER_RATE=0.000001
 PAPER_STAMP_DUTY_BUY_RATE=0.00003
 PAPER_GST_RATE=0.18
+PAPER_REPLAY_MAX_TICKS=250000
+PAPER_REPLAY_MAX_INSTRUMENTS=20
+PAPER_REPLAY_LIQUIDITY_PARTICIPATION_PCT=0.10
 ```
 
 ## Reference-data refresh workflow
@@ -445,6 +451,12 @@ qualified signal + independent strategy-to-paper policy
   -> later trusted tick + adverse-slippage/participation fill model
   -> persisted paper position + hard stop/partials/time exit
   -> daily limits + kill switch + restart-safe audit state
+
+explicit completed-session PAPER replay
+  -> immutable same-session cache hashes + eligible instrument identities
+  -> causal five-minute scanner evaluations with no future ticks
+  -> isolated in-memory paper accounts for each sensitivity scenario
+  -> recorded next-tick gaps + zero/base/double slippage + double-cost reports
 ```
 
 - `trading_bot.reference_data`: atomic cache metadata, bounded verified-HTTPS
@@ -457,6 +469,7 @@ qualified signal + independent strategy-to-paper policy
 - `trading_bot.indicators`: pure indicator functions with explicit warm-ups.
 - `trading_bot.scanner`: deterministic candidate scoring, diagnostics, and JSON.
 - `trading_bot.strategy`: broker-free qualified-signal to PAPER-intent policy.
+- `trading_bot.backtest`: frozen reference snapshots and causal PAPER replay.
 - `trading_bot.risk`: broker-neutral sizing and portfolio/day entry gates.
 - `trading_bot.paper`: broker-free paper order/fill/position state machine.
 - `trading_bot.storage`: raw ticks/feed events, projected health/references,
@@ -799,6 +812,50 @@ The policy remains a library surface and is intentionally not wired to a
 continuous scanner loop. This prevents a qualified analytical row from silently
 becoming even a simulated order before replay validation and operator review.
 
+## Causal PAPER replay
+
+`record-scanner-market` now freezes the validated instrument-master,
+intraday-allowed, and NIFTY 500 source hashes plus the exact eligible instrument
+and benchmark identities before recording starts. The first snapshot for an IST
+session is immutable. An identical recorder restart reuses it; a changed cache,
+configured universe, mapping, or eligibility set fails closed rather than
+mixing reference regimes within one session.
+
+Use a small explicit universe before recording and do not change it during the
+session:
+
+```dotenv
+SCANNER_SYMBOLS=SBIN,RELIANCE,INFY,TCS,HDFCBANK
+PAPER_REPLAY_MAX_INSTRUMENTS=20
+PAPER_REPLAY_MAX_TICKS=250000
+PAPER_REPLAY_LIQUIDITY_PARTICIPATION_PCT=0.10
+```
+
+After the recorded cash session has completed, run the read-only harness:
+
+```powershell
+python -m trading_bot paper-replay --date 2026-10-20
+python -m trading_bot paper-replay --date 2026-10-20 --json
+```
+
+The command requires the reference snapshot captured before that session and
+fails `NOT_READY` for older databases that do not have one. It never substitutes
+today's eligibility for an earlier date. It evaluates only at five-minute
+boundaries, rebuilds scanner state using ticks visible at each boundary, and
+uses completed trusted candles. Liquidity is bounded by the configured fraction
+of the latest completed five-minute recorded volume. Each accepted signal is
+submitted to separate in-memory paper engines; the source ticks, candles, and
+persisted paper tables are not changed.
+
+The default scenarios are zero slippage, configured base slippage, double
+slippage, and double estimated transaction costs. Protective stops still fill
+only on a later recorded tick, so actual recorded stop gaps remain visible and
+are counted separately. An interrupted feed while exposure exists marks the
+isolated scenario uncertain. `INCOMPLETE` results, open positions, active
+orders, uncertainty, a missing reference snapshot, excessive universe size, or
+the replay tick safety limit all produce a non-zero exit. These scenarios test
+robustness; they are not evidence of future returns.
+
 ## TLS, reconnect, and ingestion guarantees
 
 The project pins `smartapi-python==1.5.5`. That SDK's WebSocket `connect()` uses
@@ -829,14 +886,14 @@ Phase 2.5.4 and the paper engine remain local SQLite architecture: large
 universes need measured paper-session validation, projection-lag monitoring,
 and restart/reconnect testing before any future automation.
 
-The next gate is not live trading. It is an explicit replay-only harness for the
-new intent policy, followed by a reviewed paper-session orchestrator that
-connects trusted projection updates to the persisted simulator. It still needs
-slippage/cost sensitivity matrices, gap scenarios, frozen per-session cost
-snapshots, mark/reconciliation wiring for feed/queue/writer failures, sector
-confirmation, and measured forward paper runs across multiple market regimes.
-Reports must include rejected signals and uncertainty periods; no backtest or
-paper result can prove future accuracy.
+The next gate is not live trading. It is to collect several new sessions with
+their immutable reference snapshots, run the replay matrix, and review rejected
+signals, uncertainty events, recorded gaps, win rate, expectancy, and drawdown.
+Only after those results are credible should a separate, reviewed paper-session
+orchestrator connect trusted projection updates to the persisted simulator. It
+still needs frozen per-session cost snapshots, automatic trailing-stop policy,
+sector confirmation, and measured forward paper runs across multiple market
+regimes. No backtest or paper result can prove future accuracy.
 
 Live order placement, positions, order reconciliation, and any Angel order
 adapter remain absent. They must stay absent until the full acceptance gate in

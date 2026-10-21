@@ -6,6 +6,18 @@ from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta
 from time import perf_counter
 
+from .backtest import (
+    ReplayReferenceSnapshot,
+    ReplayReferenceSnapshotError,
+    build_replay_reference_snapshot,
+)
+from .backtest.replay import (
+    ReplayBacktestInputError,
+    ReplayBacktestStatus,
+    ReplayHarnessConfig,
+    ReplayPaperStrategyHarness,
+    default_replay_scenarios,
+)
 from .broker import (
     AngelCredentials,
     AngelInstrumentMasterCache,
@@ -56,6 +68,7 @@ from .storage import (
     SQLitePaperStore,
     TickIngestionService,
 )
+from .strategy import PaperIntentPolicyConfig
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -156,6 +169,12 @@ def _parser() -> argparse.ArgumentParser:
     paper_report.add_argument("--from-date", type=_iso_date)
     paper_report.add_argument("--to-date", type=_iso_date)
     paper_report.add_argument("--json", action="store_true", dest="json_output")
+    paper_replay = subparsers.add_parser(
+        "paper-replay",
+        help="causally replay one recorded session into isolated PAPER scenarios",
+    )
+    paper_replay.add_argument("--date", required=True, type=_iso_date)
+    paper_replay.add_argument("--json", action="store_true", dest="json_output")
     return parser
 
 
@@ -185,6 +204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Scanner output=ANALYSIS_ONLY")
         print("Paper execution engine available=True")
         print("Qualified-signal PAPER intent policy available=True")
+        print("Causal PAPER replay harness available=True")
         print("Automated signal-to-paper runner available=False")
         print("Order placement available=False")
         return 0
@@ -297,6 +317,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings,
             from_date=args.from_date,
             to_date=args.to_date,
+            json_output=args.json_output,
+        )
+
+    if command == "paper-replay":
+        return _paper_replay(
+            settings,
+            session_date=args.date,
             json_output=args.json_output,
         )
 
@@ -462,6 +489,101 @@ def _paper_report(
     return 0 if report.status is PaperReportStatus.COMPLETE else 2
 
 
+def _paper_replay(
+    settings: Settings,
+    *,
+    session_date: date,
+    json_output: bool,
+) -> int:
+    now = datetime.now(IST)
+    session_close = datetime.combine(session_date, time(15, 30), tzinfo=IST)
+    if session_date > now.date() or (
+        session_date == now.date() and now < session_close
+    ):
+        raise ValueError("paper replay requires a completed IST cash session")
+    try:
+        with _recorder(settings) as recorder:
+            snapshot = recorder.load_replay_reference_snapshot(session_date)
+            if snapshot is None:
+                raise ReplayBacktestInputError(
+                    "session has no immutable replay reference snapshot; "
+                    "record-scanner-market must capture it before that session"
+                )
+            harness = ReplayPaperStrategyHarness(
+                replay_engine=_replay_engine(settings),
+                scanner=_market_scanner(settings),
+                risk_limits=_risk_limits(settings),
+                execution_config=_paper_execution_config(settings),
+                intent_config=PaperIntentPolicyConfig(
+                    opening_range_minutes=settings.opening_range_minutes,
+                    entry_start=settings.paper_entry_start_time,
+                    last_entry=settings.paper_last_entry_time,
+                    stale_after_seconds=settings.market_data_stale_after_seconds,
+                    stop_buffer_atr=settings.paper_stop_buffer_atr,
+                    minimum_stop_ticks=settings.paper_minimum_stop_ticks,
+                    maximum_stop_atr=settings.paper_maximum_stop_atr,
+                ),
+                cost_schedule=_paper_cost_schedule(settings),
+                config=ReplayHarnessConfig(
+                    starting_equity=settings.paper_starting_equity,
+                    maximum_ticks=settings.paper_replay_max_ticks,
+                    maximum_instruments=settings.paper_replay_max_instruments,
+                    historical_lookback_days=(
+                        settings.historical_bootstrap_lookback_days
+                    ),
+                    liquidity_participation_pct=(
+                        settings.paper_replay_liquidity_participation_pct
+                    ),
+                ),
+                entry_start=settings.paper_entry_start_time,
+                last_entry=settings.paper_last_entry_time,
+            )
+            result = harness.run(
+                recorder,
+                snapshot=snapshot,
+                session_date=session_date,
+                scenarios=default_replay_scenarios(settings.paper_slippage_bps),
+            )
+    except (ReplayBacktestInputError, ReplayReferenceSnapshotError) as exc:
+        payload = {
+            "status": "NOT_READY",
+            "mode": "PAPER_REPLAY_ONLY",
+            "session_date": session_date.isoformat(),
+            "reason": f"{type(exc).__name__}:{exc}",
+            "source_market_data_mutated": False,
+            "broker_orders_available": False,
+        }
+        if json_output:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(
+                f"PAPER replay status=NOT_READY date={session_date.isoformat()} "
+                f"reason={payload['reason']}"
+            )
+            print("Source market data mutated=False broker_orders=False")
+        return 2
+    payload = result.to_dict()
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"PAPER replay status={result.status.value} "
+            f"date={session_date.isoformat()} ticks={result.raw_ticks} "
+            f"ready_evaluations={result.ready_evaluations}/"
+            f"{result.evaluation_count} unique_intents={result.unique_policy_intents}"
+        )
+        for scenario in result.scenarios:
+            print(
+                f"  {scenario.scenario.name}: "
+                f"trades={scenario.performance.closed_trades} "
+                f"net={scenario.performance.estimated_net_realized_pnl} "
+                f"drawdown={scenario.performance.maximum_closed_trade_drawdown} "
+                f"adverse_gap_exits={scenario.adverse_gap_exits}"
+            )
+        print("Source market data mutated=False broker_orders=False")
+    return 0 if result.status is ReplayBacktestStatus.COMPLETE else 2
+
+
 def _record_market(settings: Settings) -> int:
     _require_credentials(settings)
     subscriptions = settings.market_subscriptions()
@@ -488,6 +610,32 @@ def _record_scanner_market(settings: Settings) -> int:
         benchmark_trading_symbol=settings.nifty_benchmark_trading_symbol,
         configured_symbols=settings.configured_scanner_symbols(),
     )
+    universe = resolve_nse_equity_universe(
+        nifty_cache,
+        instrument_cache,
+        intraday_cache,
+        configured_symbols=settings.configured_scanner_symbols(),
+    )
+    benchmark = instrument_cache.find_trading_symbol(
+        Exchange.NSE_CM, settings.nifty_benchmark_trading_symbol
+    )
+    if benchmark is None or benchmark.instrument_type != "AMXIDX":
+        raise ScannerSubscriptionError(
+            "authoritative NIFTY benchmark mapping is missing or invalid"
+        )
+    snapshot = build_replay_reference_snapshot(
+        session_date=now.date(),
+        captured_at=now,
+        instrument_cache=instrument_cache,
+        intraday_cache=intraday_cache,
+        nifty500_cache=nifty_cache,
+        configured_symbols=settings.configured_scanner_symbols(),
+        instruments=universe.instruments,
+        benchmark=benchmark,
+        exclusions=tuple(
+            f"{item.symbol}:{item.reason}" for item in universe.exclusions
+        ),
+    )
     print(
         "Scanner subscriptions: "
         f"requested={plan.requested_count} eligible={plan.eligible_count} "
@@ -501,6 +649,7 @@ def _record_scanner_market(settings: Settings) -> int:
         plan.subscriptions,
         description=f"{len(plan.subscriptions)} scanner subscription(s)",
         incremental_projection=True,
+        replay_reference_snapshot=snapshot,
     )
 
 
@@ -510,6 +659,7 @@ def _record_subscriptions(
     *,
     description: str,
     incremental_projection: bool = False,
+    replay_reference_snapshot: ReplayReferenceSnapshot | None = None,
 ) -> int:
     if len(subscriptions) > 1_000:
         raise ScannerSubscriptionError(
@@ -530,6 +680,15 @@ def _record_subscriptions(
         reconnect_policy=policy,
     )
     with _recorder(settings) as recorder:
+        if replay_reference_snapshot is not None:
+            saved_snapshot = recorder.save_replay_reference_snapshot(
+                replay_reference_snapshot
+            )
+            print(
+                "Replay reference snapshot: "
+                f"date={saved_snapshot.session_date.isoformat()} "
+                f"sha256={saved_snapshot.payload_sha256}"
+            )
         projection = None
         writer = recorder
         if incremental_projection:
@@ -1644,26 +1803,32 @@ def _paper_engine(
 ) -> PaperExecutionEngine:
     return PaperExecutionEngine(
         store,
-        RiskLimits(
-            risk_per_trade_pct=settings.risk_per_trade_pct,
-            max_daily_loss_pct=settings.max_daily_loss_pct,
-            max_open_positions=settings.max_open_positions,
-            max_trades_per_day=settings.max_trades_per_day,
-            max_consecutive_losses=settings.max_consecutive_losses,
-            max_capital_utilization_pct=(
-                settings.max_capital_utilization_pct
-            ),
-        ),
-        config=PaperExecutionConfig(
-            slippage_bps=settings.paper_slippage_bps,
-            tick_participation_pct=settings.paper_tick_participation_pct,
-            first_partial_pct=settings.paper_first_partial_pct,
-            second_partial_pct=settings.paper_second_partial_pct,
-            square_off_time=settings.paper_square_off_time,
-            stale_after_seconds=settings.market_data_stale_after_seconds,
-        ),
+        _risk_limits(settings),
+        config=_paper_execution_config(settings),
         entry_start=settings.paper_entry_start_time,
         last_entry=settings.paper_last_entry_time,
+    )
+
+
+def _risk_limits(settings: Settings) -> RiskLimits:
+    return RiskLimits(
+        risk_per_trade_pct=settings.risk_per_trade_pct,
+        max_daily_loss_pct=settings.max_daily_loss_pct,
+        max_open_positions=settings.max_open_positions,
+        max_trades_per_day=settings.max_trades_per_day,
+        max_consecutive_losses=settings.max_consecutive_losses,
+        max_capital_utilization_pct=settings.max_capital_utilization_pct,
+    )
+
+
+def _paper_execution_config(settings: Settings) -> PaperExecutionConfig:
+    return PaperExecutionConfig(
+        slippage_bps=settings.paper_slippage_bps,
+        tick_participation_pct=settings.paper_tick_participation_pct,
+        first_partial_pct=settings.paper_first_partial_pct,
+        second_partial_pct=settings.paper_second_partial_pct,
+        square_off_time=settings.paper_square_off_time,
+        stale_after_seconds=settings.market_data_stale_after_seconds,
     )
 
 

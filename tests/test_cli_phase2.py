@@ -18,6 +18,7 @@ def test_cli_exposes_data_analysis_and_paper_only_commands() -> None:
         "paper-status",
         "paper-kill-switch",
         "paper-report",
+        "paper-replay",
     )
 
     for command in commands:
@@ -30,6 +31,8 @@ def test_cli_exposes_data_analysis_and_paper_only_commands() -> None:
             arguments.extend(["--date", "2026-08-10"])
         if command == "paper-kill-switch":
             arguments.extend(["--reason", "test"])
+        if command == "paper-replay":
+            arguments.extend(["--date", "2026-08-10"])
         parsed = parser.parse_args(arguments)
         assert parsed.command == command
 
@@ -60,6 +63,21 @@ def test_paper_report_has_no_data_until_a_session_is_initialized(
     assert '"status": "NO_DATA"' in output
     assert '"broker_orders_available": false' in output
     assert '"estimate_only": true' in output
+
+
+def test_paper_replay_fails_closed_without_frozen_session_references(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'no-snapshot.db').as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+
+    assert main(["paper-replay", "--date", "2026-08-10", "--json"]) == 2
+
+    output = capsys.readouterr().out
+    assert '"status": "NOT_READY"' in output
+    assert '"mode": "PAPER_REPLAY_ONLY"' in output
+    assert '"broker_orders_available": false' in output
+    assert "no immutable replay reference snapshot" in output
 
 
 def test_paper_cli_initializes_reports_and_kills_without_broker_orders(
